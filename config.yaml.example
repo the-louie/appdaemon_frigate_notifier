@@ -1,0 +1,13 @@
+example_motion:
+  module: i1_motion_lights
+  class: GenericMotion
+  sensor: binary_sensor.motion_sensor_home_security_motion_detection
+  state_id: unique_state_id_for_example 
+  light:
+    - light.lamp_1
+    - light.lamp_2
+  from: "off"
+  to: "on"
+  sunup: True # also when sun is up
+  timeout: 1200 # time to turn off again
+
