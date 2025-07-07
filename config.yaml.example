@@ -1,25 +1,87 @@
+# Example configuration for Frigate Notification App
+# Copy this to your AppDaemon conf directory and customize
+
 frigate_notify:
   module: i1_frigate_notifier
   class: FrigateNotification
-  hass_base_url: "https://bycdqh1ayurhtfazfifttriwtrivwewa.ui.nabu.casa/api/frigate/notifications"
-  ext_domain: "https://bycdqh1ayurhtfazfifttriwtrivwewa.ui.nabu.casa"
-  event_url: "https://frigate.example.com/vod/event/"
-  frigate_url: "https://frigate.example.com/api/events"
-  topic: "frigate/events"
+
+  # MQTT Configuration
+  mqtt_topic: "frigate/events"
+
+  # Frigate Configuration
+  frigate_url: "https://your-frigate-instance.com/api/events"
+  ext_domain: "https://your-external-domain.com"
+
+  # Storage Configuration
+  snapshot_dir: "/config/frigate_snapshots"
+
+  # Filtering Options
+  only_zones: true  # Only notify when objects enter zones
+
+  # Advanced Settings
+  max_retries: 3           # Number of retry attempts for downloads
+  retry_delay: 5           # Seconds between retry attempts
+  max_file_age_days: 30    # Days to keep video files before cleanup
+  enable_metrics: true     # Enable metrics logging
+
+  # User Notifications
   persons:
-    - name: anders
-      notify: mobile_app_iphone_28
-      tracker: device_tracker.iphone_28
-      cooldown: 120
+    - name: "Primary User"
+      notify: "mobile_app_primary_phone"
       labels:
-        - person
-  sensor: binary_sensor.doorbell_person_motion
-  only_zones: True
-  snapshot_dir: "/snapshots"
+        - "person"
+        - "car"
+        - "truck"
+      cooldown: 120  # 2 minutes
+      zones:
+        - "driveway"
+        - "front_door"
+        - "backyard"
+      cameras:
+        - "doorbell_cam"
+        - "driveway_cam"
+        - "backyard_cam"
+
+    - name: "Secondary User"
+      notify: "mobile_app_secondary_phone"
+      labels:
+        - "person"
+      cooldown: 300  # 5 minutes
+      # No zone/camera filters - will receive all person events
+
+    - name: "Emergency Contact"
+      notify: "notify.telegram"
+      labels:
+        - "person"
+        - "car"
+        - "truck"
+        - "bicycle"
+      cooldown: 60  # 1 minute
+      zones:
+        - "driveway"
+        - "front_door"
+      cameras:
+        - "doorbell_cam"
+        - "driveway_cam"
+
+    - name: "Night Watch"
+      notify: "mobile_app_night_phone"
+      labels:
+        - "person"
+        - "car"
+      cooldown: 180  # 3 minutes
+      zones:
+        - "driveway"
+        - "side_yard"
+      cameras:
+        - "driveway_cam"
+        - "side_yard_cam"
+
+  # Camera Icons (optional)
   cam_icons:
     doorbell_cam: "mdi:doorbell-video"
     driveway_cam: "mdi:car-estate"
-    south_cam: "mdi:home-group"
-    eastside_cam: "mdi:tree"
-    southeast_cam: "mdi:stairs"
-    southwest_cam: "mdi:door"
+    backyard_cam: "mdi:home-group"
+    front_yard_cam: "mdi:home-variant"
+    garage_cam: "mdi:garage"
+    side_yard_cam: "mdi:fence"
