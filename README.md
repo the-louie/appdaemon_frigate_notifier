@@ -1,5 +1,7 @@
 # Frigate Notification App for AppDaemon
 
+Copyright (c) 2024 the_louie
+
 A sophisticated AppDaemon application that listens to Frigate MQTT events and sends intelligent notifications to configured users when motion is detected. This app supports zone filtering, cooldown periods, video clip downloads, and customizable notification settings with enterprise-grade reliability and performance.
 
 ## Features
