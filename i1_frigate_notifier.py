@@ -551,7 +551,7 @@ class FrigateNotification(hass.Hass):
 
             self.msg_cooldown[cooldown_key] = time.time()
             self.metrics.notifications_sent += 1
-            self.log(f"Notification sent to {person_config.name}")
+            self.log(f"Notification sent to {person_config.name} - {title}")
 
         except Exception as e:
             self.log(f"ERROR: Failed to send notification to {person_config.name}: {e}", level="ERROR")
