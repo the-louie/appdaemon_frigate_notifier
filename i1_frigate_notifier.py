@@ -542,6 +542,20 @@ class FrigateNotification(hass.Hass):
             title = f"{event_data.label} @ {event_data.camera}"
             message = f"{timestamp} - {zone_str} (ID: {event_data.event_id})"
 
+            # Check if video/image is attached and determine reason if not
+            has_attachment = "video" in notification_data
+            attachment_reason = "Video attached"
+
+            if not has_attachment:
+                if not self.frigate_url:
+                    attachment_reason = "No Frigate URL configured"
+                elif not self.snapshot_dir:
+                    attachment_reason = "No snapshot directory configured"
+                elif not self.ext_domain:
+                    attachment_reason = "No external domain configured"
+                else:
+                    attachment_reason = "Video download in progress (async)"
+
             self.call_service(
                 f"notify/{person_config.notify}",
                 title=title,
@@ -551,7 +565,7 @@ class FrigateNotification(hass.Hass):
 
             self.msg_cooldown[cooldown_key] = time.time()
             self.metrics.notifications_sent += 1
-            self.log(f"Notification sent to {person_config.name} - {title}")
+            self.log(f"Notification sent to {person_config.name} - {title} - Event ID: {event_data.event_id} - Attachment: {'Yes' if has_attachment else 'No'} - Reason: {attachment_reason}")
 
         except Exception as e:
             self.log(f"ERROR: Failed to send notification to {person_config.name}: {e}", level="ERROR")
