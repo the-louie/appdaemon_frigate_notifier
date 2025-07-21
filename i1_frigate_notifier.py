@@ -507,13 +507,13 @@ class FrigateNotification(hass.Hass):
             target_dir = self.snapshot_dir / camera / date_dir
             target_dir.mkdir(parents=True, exist_ok=True)
 
-            filename = f"{timestamp}--{event_id}.gif"
+            filename = f"{timestamp}--{event_id}.jpg"
             target_path = target_dir / filename
 
             if target_path.exists():
                 return f"{camera}/{date_dir}/{filename}"
 
-            thumbnail_url = f"{self.frigate_url}/{event_id}/preview.gif"
+            thumbnail_url = f"{self.frigate_url}/{event_id}/snapshot.jpg"
 
             # Use urllib instead of requests to reduce dependencies
             req = urllib.request.Request(thumbnail_url)
@@ -527,6 +527,7 @@ class FrigateNotification(hass.Hass):
 
         except Exception as e:
             self.log(f"ERROR: Failed to download thumbnail for event {event_id}: {e}", level="ERROR")
+            self.log(f"       {thumbnail_url}")
             return None
 
     def _add_to_cache(self, cache_key: str, file_path: str, file_size: int) -> None:
