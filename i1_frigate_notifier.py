@@ -420,53 +420,92 @@ class FrigateNotification(hass.Hass):
 
     def _download_video_clip(self, event_id: str, camera: str) -> Optional[str]:
         """Download video clip from Frigate with retry logic and caching."""
+        self.log(f"DEBUG: Starting video download for event {event_id}, camera {camera}")
+
         cache_key = f"{event_id}_{camera}"
         with self.cache_lock:
             if cache_key in self.file_cache:
                 cache_entry = self.file_cache[cache_key]
                 if (datetime.now() - cache_entry.timestamp).total_seconds() < self.cache_ttl_hours * 3600:
+                    self.log(f"DEBUG: Video found in cache for event {event_id}")
                     self.metrics.downloads_successful += 1
                     return cache_entry.file_path
+                else:
+                    self.log(f"DEBUG: Cache entry expired for event {event_id}")
 
         for attempt in range(self.max_retries):
             try:
+                self.log(f"DEBUG: Download attempt {attempt + 1}/{self.max_retries} for event {event_id}")
+
                 now = datetime.now()
                 timestamp = now.strftime("%Y%m%d_%H:%M:%S")
                 date_dir = now.strftime("%Y-%m-%d")
                 target_dir = self.snapshot_dir / camera / date_dir
+
+                self.log(f"DEBUG: Creating target directory: {target_dir}")
                 target_dir.mkdir(parents=True, exist_ok=True)
 
                 filename = f"{timestamp}--{event_id}.mp4"
                 target_path = target_dir / filename
+                self.log(f"DEBUG: Target file path: {target_path}")
 
                 if target_path.exists():
+                    self.log(f"DEBUG: Video file already exists for event {event_id}")
                     self._add_to_cache(cache_key, str(target_path), target_path.stat().st_size)
                     self.metrics.downloads_successful += 1
                     return f"{camera}/{date_dir}/{filename}"
 
                 clip_url = f"{self.frigate_url}/{event_id}/clip.mp4"
+                self.log(f"DEBUG: Downloading from URL: {clip_url}")
 
                 # Use urllib instead of requests to reduce dependencies
                 req = urllib.request.Request(clip_url)
                 req.add_header('User-Agent', 'FrigateNotifier/1.0')
+                self.log(f"DEBUG: Request headers: {dict(req.headers)}")
 
+                self.log(f"DEBUG: Opening URL connection with timeout {self.connection_timeout}s")
                 with urllib.request.urlopen(req, timeout=self.connection_timeout) as response:
+                    self.log(f"DEBUG: Response status: {response.status}")
+                    self.log(f"DEBUG: Response headers: {dict(response.headers)}")
+
+                    content_length = response.headers.get('Content-Length')
+                    if content_length:
+                        self.log(f"DEBUG: Expected file size: {content_length} bytes")
+
+                    self.log(f"DEBUG: Starting file download to {target_path}")
                     with open(target_path, 'wb') as f:
-                        f.write(response.read())
+                        data = response.read()
+                        f.write(data)
+                        self.log(f"DEBUG: Downloaded {len(data)} bytes")
 
                 file_size = target_path.stat().st_size
+                self.log(f"DEBUG: File saved successfully, size: {file_size} bytes")
                 self._add_to_cache(cache_key, str(target_path), file_size)
                 self.metrics.downloads_successful += 1
 
                 return f"{camera}/{date_dir}/{filename}"
 
             except (urllib.error.URLError, urllib.error.HTTPError) as e:
+                self.log(f"DEBUG: Network error on attempt {attempt + 1}: {type(e).__name__}: {e}")
+                if hasattr(e, 'code'):
+                    self.log(f"DEBUG: HTTP status code: {e.code}")
+                if hasattr(e, 'reason'):
+                    self.log(f"DEBUG: Error reason: {e.reason}")
+                if hasattr(e, 'url'):
+                    self.log(f"DEBUG: Failed URL: {e.url}")
+
                 if attempt < self.max_retries - 1:
+                    self.log(f"DEBUG: Retrying in {self.retry_delay} seconds...")
                     time.sleep(self.retry_delay)
+                else:
+                    self.log(f"DEBUG: All retry attempts exhausted for event {event_id}")
+
             except Exception as e:
+                self.log(f"DEBUG: Unexpected error on attempt {attempt + 1}: {type(e).__name__}: {e}")
                 self.log(f"ERROR: Unexpected error downloading video clip: {e}", level="ERROR")
                 break
 
+        self.log(f"DEBUG: Video download failed for event {event_id} after {self.max_retries} attempts")
         self.metrics.downloads_failed += 1
         return None
 
