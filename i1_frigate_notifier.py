@@ -470,6 +470,65 @@ class FrigateNotification(hass.Hass):
         self.metrics.downloads_failed += 1
         return None
 
+    def _wait_for_video_download(self, event_id: str, camera: str, timeout: int = 30) -> Optional[str]:
+        """Wait for video download to complete with timeout."""
+        start_time = time.time()
+        cache_key = f"{event_id}_{camera}"
+
+        while time.time() - start_time < timeout:
+            with self.cache_lock:
+                if cache_key in self.file_cache:
+                    cache_entry = self.file_cache[cache_key]
+                    if (datetime.now() - cache_entry.timestamp).total_seconds() < self.cache_ttl_hours * 3600:
+                        return cache_entry.file_path
+
+            # Check if file exists on disk
+            now = datetime.now()
+            date_dir = now.strftime("%Y-%m-%d")
+            target_dir = self.snapshot_dir / camera / date_dir
+            timestamp = now.strftime("%Y%m%d_%H:%M:%S")
+            filename = f"{timestamp}--{event_id}.mp4"
+            target_path = target_dir / filename
+
+            if target_path.exists():
+                self._add_to_cache(cache_key, str(target_path), target_path.stat().st_size)
+                return f"{camera}/{date_dir}/{filename}"
+
+            time.sleep(0.5)  # Check every 500ms
+
+        return None
+
+    def _download_thumbnail(self, event_id: str, camera: str) -> Optional[str]:
+        """Download thumbnail image from Frigate."""
+        try:
+            now = datetime.now()
+            timestamp = now.strftime("%Y%m%d_%H:%M:%S")
+            date_dir = now.strftime("%Y-%m-%d")
+            target_dir = self.snapshot_dir / camera / date_dir
+            target_dir.mkdir(parents=True, exist_ok=True)
+
+            filename = f"{timestamp}--{event_id}.gif"
+            target_path = target_dir / filename
+
+            if target_path.exists():
+                return f"{camera}/{date_dir}/{filename}"
+
+            thumbnail_url = f"{self.frigate_url}/{event_id}/preview.gif"
+
+            # Use urllib instead of requests to reduce dependencies
+            req = urllib.request.Request(thumbnail_url)
+            req.add_header('User-Agent', 'FrigateNotifier/1.0')
+
+            with urllib.request.urlopen(req, timeout=self.connection_timeout) as response:
+                with open(target_path, 'wb') as f:
+                    f.write(response.read())
+
+            return f"{camera}/{date_dir}/{filename}"
+
+        except Exception as e:
+            self.log(f"ERROR: Failed to download thumbnail for event {event_id}: {e}", level="ERROR")
+            return None
+
     def _add_to_cache(self, cache_key: str, file_path: str, file_size: int) -> None:
         """Add file to cache."""
         with self.cache_lock:
@@ -554,7 +613,19 @@ class FrigateNotification(hass.Hass):
                 elif not self.ext_domain:
                     attachment_reason = "No external domain configured"
                 else:
-                    attachment_reason = "Video download in progress (async)"
+                    # Wait for video download with timeout, fallback to thumbnail
+                    video_path = self._wait_for_video_download(event_data.event_id, event_data.camera, timeout=30)
+                    if video_path:
+                        notification_data["video"] = f"{self.ext_domain}/local/frigate/{video_path}"
+                        has_attachment = True
+                        attachment_reason = "Video attached (waited)"
+                    else:
+                        # Download thumbnail as fallback
+                        thumbnail_path = self._download_thumbnail(event_data.event_id, event_data.camera)
+                        if thumbnail_path:
+                            notification_data["image"] = f"{self.ext_domain}/local/frigate/{thumbnail_path}"
+                            has_attachment = True
+                            attachment_reason = "Thumbnail attached (video timeout)"
 
             self.call_service(
                 f"notify/{person_config.notify}",
