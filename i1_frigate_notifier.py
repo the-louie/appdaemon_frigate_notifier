@@ -30,6 +30,7 @@ Configuration:
 import appdaemon.plugins.hass.hassapi as hass
 import json
 import time
+import sys
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Set
 from pathlib import Path
@@ -221,6 +222,27 @@ class FrigateNotification(hass.Hass):
         self.cache_ttl_hours = self.args.get("cache_ttl_hours", 24)
         self.connection_timeout = self.args.get("connection_timeout", 30)
 
+                # Priority configuration
+        priority_config = self.args.get("priority", {})
+
+        # Load zone priorities
+        zone_priorities_raw = priority_config.get("zones", {})
+        self.zone_priorities = {}
+        for zone, priority_str in zone_priorities_raw.items():
+            try:
+                self.zone_priorities[zone] = EventPriority[priority_str.upper()]
+            except (KeyError, AttributeError):
+                self.zone_priorities[zone] = EventPriority.NORMAL
+
+        # Load label priorities
+        label_priorities_raw = priority_config.get("labels", {})
+        self.label_priorities = {}
+        for label, priority_str in label_priorities_raw.items():
+            try:
+                self.label_priorities[label] = EventPriority[priority_str.upper()]
+            except (KeyError, AttributeError):
+                self.label_priorities[label] = EventPriority.NORMAL
+
     def _load_person_configs(self) -> None:
         """Load and validate person configurations."""
         persons_raw = self.args.get("persons", [])
@@ -262,7 +284,7 @@ class FrigateNotification(hass.Hass):
                 self.person_configs.append(person_config)
 
             except Exception as e:
-                self.log(f"ERROR: Failed to load person config: {e}", level="ERROR")
+                self.log(f"ERROR: Failed to load person config: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
     def _setup_mqtt(self) -> None:
         """Set up MQTT connection and event listener."""
@@ -279,7 +301,7 @@ class FrigateNotification(hass.Hass):
 
         except Exception as e:
             self.connection_status = ConnectionStatus.ERROR
-            self.log(f"ERROR: Failed to set up MQTT: {e}", level="ERROR")
+            self.log(f"ERROR: Failed to set up MQTT: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
     def _start_processing_thread(self) -> None:
         """Start the event processing thread."""
@@ -298,7 +320,7 @@ class FrigateNotification(hass.Hass):
                 if event:
                     self._process_event(event)
             except Exception as e:
-                self.log(f"ERROR: Event processing worker error: {e}", level="ERROR")
+                self.log(f"ERROR: Event processing worker error: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
                 self.metrics.errors += 1
 
     def _handle_mqtt_message(self, event_name: str, data: Dict[str, Any], kwargs: Dict[str, Any]) -> None:
@@ -334,7 +356,7 @@ class FrigateNotification(hass.Hass):
                 self.metrics.queue_size = self.event_queue.size()
 
         except Exception as e:
-            self.log(f"ERROR: Failed to process MQTT message: {e}", level="ERROR")
+            self.log(f"ERROR: Failed to process MQTT message: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
             self.metrics.errors += 1
 
     def _extract_event_data(self, payload: Dict[str, Any]) -> Optional[EventData]:
@@ -352,7 +374,16 @@ class FrigateNotification(hass.Hass):
             if not event_id:
                 return None
 
-            priority = self._determine_event_priority(label, entered_zones)
+            # Determine priority based on zones and labels
+            zone_priority = EventPriority.NORMAL
+            for zone in entered_zones:
+                if zone in self.zone_priorities:
+                    zone_priority = max(zone_priority, self.zone_priorities[zone])
+
+            label_priority = self.label_priorities.get(label, EventPriority.NORMAL)
+
+            # Use the highest priority between zone and label
+            priority = max(zone_priority, label_priority)
 
             return EventData(
                 event_id=event_id,
@@ -367,20 +398,8 @@ class FrigateNotification(hass.Hass):
             )
 
         except Exception as e:
-            self.log(f"ERROR: Failed to extract event data: {e}", level="ERROR")
+            self.log(f"ERROR: Failed to extract event data: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
             return None
-
-    def _determine_event_priority(self, label: str, zones: List[str]) -> EventPriority:
-        """Determine event priority based on label and zones."""
-        critical_zones = {"front_door", "driveway", "entrance"}
-        if any(zone in critical_zones for zone in zones):
-            return EventPriority.CRITICAL
-
-        high_priority_labels = {"person", "car", "truck"}
-        if label in high_priority_labels:
-            return EventPriority.HIGH
-
-        return EventPriority.NORMAL
 
     def _process_event(self, event_data: EventData) -> None:
         """Process a Frigate event."""
@@ -389,10 +408,7 @@ class FrigateNotification(hass.Hass):
         try:
             self.metrics.events_processed += 1
 
-            if not event_data.event_id:
-                return
-
-            if event_data.event_type != "end":
+            if not event_data.event_id or event_data.event_type != "end":
                 return
 
             if self.only_zones and not event_data.entered_zones:
@@ -409,21 +425,21 @@ class FrigateNotification(hass.Hass):
             )
 
         except Exception as e:
-            self.log(f"ERROR: Failed to process event: {e}", level="ERROR")
+            self.log(f"ERROR: Failed to process event: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
             self.metrics.errors += 1
 
     def _download_and_notify(self, event_data: EventData) -> None:
         """Download media and send notifications."""
         try:
             # Try to download video first with 30s timeout and 2s retries
-            video_path = self._download_video_with_retry(event_data.event_id, event_data.camera)
+            video_path = self._download_media_with_retry(event_data.event_id, event_data.camera, "clip.mp4", ".mp4")
 
             if video_path:
                 self._send_notifications(event_data, video_path, "video")
                 return
 
             # Fallback to snapshot if video download failed
-            snapshot_path = self._download_snapshot(event_data.event_id, event_data.camera)
+            snapshot_path = self._download_media_with_retry(event_data.event_id, event_data.camera, "snapshot.jpg", ".jpg")
             if snapshot_path:
                 self._send_notifications(event_data, snapshot_path, "image")
             else:
@@ -431,33 +447,32 @@ class FrigateNotification(hass.Hass):
                 self._send_notifications(event_data, None, None)
 
         except Exception as e:
-            self.log(f"ERROR: Failed to download and notify for event {event_data.event_id}: {e}", level="ERROR")
+            self.log(f"ERROR: Failed to download and notify for event {event_data.event_id}: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
             self.metrics.errors += 1
 
-    def _download_video_with_retry(self, event_id: str, camera: str) -> Optional[str]:
-        """Download video with 30s timeout and 2s retries."""
+    def _download_media_with_retry(self, event_id: str, camera: str, endpoint: str, extension: str) -> Optional[str]:
+        """Download media with 30s timeout and 2s retries."""
         start_time = time.time()
         timeout = 30
         retry_interval = 2
 
         while time.time() - start_time < timeout:
             try:
-                video_path = self._download_video_clip(event_id, camera)
-                if video_path:
-                    return video_path
+                media_path = self._download_media(event_id, camera, endpoint, extension)
+                if media_path:
+                    return media_path
             except Exception as e:
-                self.log(f"ERROR: Video download attempt failed for event {event_id}: {e}", level="ERROR")
+                self.log(f"ERROR: Media download attempt failed for event {event_id}: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
                 self.metrics.downloads_failed += 1
 
-            # Wait before retry
             time.sleep(retry_interval)
 
-        self.log(f"Video download timeout after {timeout}s for event {event_id}")
+        self.log(f"Media download timeout after {timeout}s for event {event_id}")
         return None
 
-    def _download_video_clip(self, event_id: str, camera: str) -> Optional[str]:
-        """Download video clip from Frigate."""
-        cache_key = f"{event_id}_{camera}"
+    def _download_media(self, event_id: str, camera: str, endpoint: str, extension: str) -> Optional[str]:
+        """Download media file from Frigate."""
+        cache_key = f"{event_id}_{camera}_{endpoint}"
 
         # Check cache first
         with self.cache_lock:
@@ -467,14 +482,14 @@ class FrigateNotification(hass.Hass):
                     self.metrics.downloads_successful += 1
                     return cache_entry.file_path
 
-        # Download new video
+        # Download new media
         now = datetime.now()
         timestamp = now.strftime("%Y%m%d_%H:%M:%S")
         date_dir = now.strftime("%Y-%m-%d")
         target_dir = self.snapshot_dir / camera / date_dir
         target_dir.mkdir(parents=True, exist_ok=True)
 
-        filename = f"{timestamp}--{event_id}.mp4"
+        filename = f"{timestamp}--{event_id}{extension}"
         target_path = target_dir / filename
 
         if target_path.exists():
@@ -482,8 +497,8 @@ class FrigateNotification(hass.Hass):
             self.metrics.downloads_successful += 1
             return f"{camera}/{date_dir}/{filename}"
 
-        clip_url = f"{self.frigate_url}/{event_id}/clip.mp4"
-        req = urllib.request.Request(clip_url)
+        media_url = f"{self.frigate_url}/{event_id}/{endpoint}"
+        req = urllib.request.Request(media_url)
         req.add_header('User-Agent', 'FrigateNotifier/1.0')
 
         with urllib.request.urlopen(req, timeout=self.connection_timeout) as response:
@@ -495,35 +510,6 @@ class FrigateNotification(hass.Hass):
         self.metrics.downloads_successful += 1
 
         return f"{camera}/{date_dir}/{filename}"
-
-    def _download_snapshot(self, event_id: str, camera: str) -> Optional[str]:
-        """Download snapshot image from Frigate."""
-        try:
-            now = datetime.now()
-            timestamp = now.strftime("%Y%m%d_%H:%M:%S")
-            date_dir = now.strftime("%Y-%m-%d")
-            target_dir = self.snapshot_dir / camera / date_dir
-            target_dir.mkdir(parents=True, exist_ok=True)
-
-            filename = f"{timestamp}--{event_id}.jpg"
-            target_path = target_dir / filename
-
-            if target_path.exists():
-                return f"{camera}/{date_dir}/{filename}"
-
-            thumbnail_url = f"{self.frigate_url}/{event_id}/snapshot.jpg"
-            req = urllib.request.Request(thumbnail_url)
-            req.add_header('User-Agent', 'FrigateNotifier/1.0')
-
-            with urllib.request.urlopen(req, timeout=self.connection_timeout) as response:
-                with open(target_path, 'wb') as f:
-                    f.write(response.read())
-
-            return f"{camera}/{date_dir}/{filename}"
-
-        except Exception as e:
-            self.log(f"ERROR: Failed to download snapshot for event {event_id}: {e}", level="ERROR")
-            return None
 
     def _add_to_cache(self, cache_key: str, file_path: str, file_size: int) -> None:
         """Add file to cache."""
@@ -613,7 +599,7 @@ class FrigateNotification(hass.Hass):
                     self.connection_status = ConnectionStatus.ERROR
 
         except Exception as e:
-            self.log(f"ERROR: Connection health check failed: {e}", level="ERROR")
+            self.log(f"ERROR: Connection health check failed: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
     def _cleanup_old_files(self, kwargs: Dict[str, Any]) -> None:
         """Clean up old video files to prevent disk space issues."""
@@ -633,7 +619,7 @@ class FrigateNotification(hass.Hass):
                 self.log(f"Cleaned up {files_removed} old video files")
 
         except Exception as e:
-            self.log(f"ERROR: Failed to cleanup old files: {e}", level="ERROR")
+            self.log(f"ERROR: Failed to cleanup old files: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
     def _cleanup_cache(self, kwargs: Dict[str, Any]) -> None:
         """Clean up expired cache entries and limit cache size."""
@@ -662,7 +648,7 @@ class FrigateNotification(hass.Hass):
                 self.log(f"Cleaned up {len(expired_keys)} expired cache entries")
 
         except Exception as e:
-            self.log(f"ERROR: Failed to cleanup cache: {e}", level="ERROR")
+            self.log(f"ERROR: Failed to cleanup cache: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
     def _log_metrics(self, kwargs: Dict[str, Any]) -> None:
         """Log metrics for monitoring."""

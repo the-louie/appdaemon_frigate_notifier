@@ -22,6 +22,17 @@ frigate_notify:
   max_file_age_days: 30    # Days to keep video files before cleanup
   enable_metrics: true     # Enable metrics logging
 
+  priority:
+    zones:
+      front_door: critical
+      driveway: critical
+      entrance: critical
+      backyard: high
+    labels:
+      person: critical
+      car: high
+      cat: normal
+
   # User Notifications
   persons:
     - name: "Primary User"
