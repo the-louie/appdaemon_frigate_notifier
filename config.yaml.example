@@ -20,7 +20,8 @@ frigate_notify:
 
   # Advanced Settings
   max_file_age_days: 30    # Days to keep video files before cleanup
-  enable_metrics: true     # Enable metrics logging
+  cache_ttl_hours: 24      # Hours to keep cache entries
+  connection_timeout: 30   # Connection timeout in seconds
 
   priority:
     zones:

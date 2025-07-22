@@ -1,0 +1,23 @@
+{
+  "daily_metrics": [
+    {
+      "date": "2025-01-20",
+      "total_notifications": 15,
+      "min_seconds": 0.245,
+      "avg_seconds": 0.523,
+      "max_seconds": 1.234
+    },
+    {
+      "date": "2025-01-21",
+      "total_notifications": 12,
+      "min_seconds": 0.198,
+      "avg_seconds": 0.456,
+      "max_seconds": 0.987,
+      "comparison": {
+        "min_diff": -0.047,
+        "avg_diff": -0.067,
+        "max_diff": -0.247
+      }
+    }
+  ]
+}
