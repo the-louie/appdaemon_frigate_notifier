@@ -378,12 +378,16 @@ class FrigateNotification(hass.Hass):
             zone_priority = EventPriority.NORMAL
             for zone in entered_zones:
                 if zone in self.zone_priorities:
-                    zone_priority = max(zone_priority, self.zone_priorities[zone])
+                    if self.zone_priorities[zone].value > zone_priority.value:
+                        zone_priority = self.zone_priorities[zone]
 
             label_priority = self.label_priorities.get(label, EventPriority.NORMAL)
 
             # Use the highest priority between zone and label
-            priority = max(zone_priority, label_priority)
+            if label_priority.value > zone_priority.value:
+                priority = label_priority
+            else:
+                priority = zone_priority
 
             return EventData(
                 event_id=event_id,
