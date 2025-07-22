@@ -1,6 +1,6 @@
 # Frigate Notification App for AppDaemon
 
-Copyright (c) 2024 the_louie
+Copyright (c) 2025 the_louie
 
 A sophisticated AppDaemon application that listens to Frigate MQTT events and sends intelligent notifications to configured users when motion is detected. This app supports zone filtering, cooldown periods, video clip downloads, and customizable notification settings with enterprise-grade reliability and performance.
 
@@ -51,8 +51,6 @@ frigate_notify:
 
 ```yaml
   # Advanced Settings
-  max_retries: 3           # Number of retry attempts for downloads
-  retry_delay: 5           # Seconds between retry attempts
   max_file_age_days: 30    # Days to keep video files before cleanup
   enable_metrics: true     # Enable metrics logging
   cache_ttl_hours: 24      # Hours to keep cache entries
@@ -107,8 +105,7 @@ frigate_notify:
 | `ext_domain` | string | Yes | External domain for notification links |
 | `snapshot_dir` | string | No | Directory to save video clips |
 | `only_zones` | boolean | No | Only notify when objects enter zones (default: false) |
-| `max_retries` | integer | No | Download retry attempts (default: 3) |
-| `retry_delay` | integer | No | Seconds between retries (default: 5) |
+
 | `max_file_age_days` | integer | No | Days to keep files (default: 30) |
 | `enable_metrics` | boolean | No | Enable metrics logging (default: true) |
 | `cache_ttl_hours` | integer | No | Cache time-to-live in hours (default: 24) |
@@ -136,7 +133,7 @@ frigate_notify:
 3. **Priority Assignment**: Automatically determines event priority based on zones and labels
 4. **Queue Management**: Events are queued with priority ordering for processing
 4. **Zone Filtering**: If `only_zones` is enabled, skips events without zone entries
-5. **Async Download**: Downloads video clips in background threads with retry logic and caching
+5. **Media Download**: Downloads video clips with 30s timeout and 2s retries, falls back to snapshots
 6. **User Filtering**: Checks each user's preferences (labels, zones, cameras, cooldown, priority)
 7. **Notification**: Sends rich notifications with video links and camera shortcuts
 8. **Cleanup**: Automatically removes old video files and cache entries
@@ -174,10 +171,10 @@ frigate_notify:
 - Video downloads use a thread pool (5 workers) for concurrent processing
 - Non-blocking MQTT message handling
 
-### Retry Logic
-- Automatic retry for failed video downloads
-- Configurable retry attempts and delays
-- Graceful handling of network issues
+### Media Download Logic
+- Video downloads with 30-second timeout and 2-second retries
+- Automatic fallback to snapshot images if video fails
+- Immediate notification sending when media is available
 
 ### File Management
 - Automatic cleanup of old video files
@@ -268,7 +265,6 @@ AvgProcessingTime=0.125s, Connection=connected
    - Verify `frigate_url` is accessible
    - Check `snapshot_dir` permissions
    - Ensure sufficient disk space
-   - Check retry settings
    - Verify connection timeout
 
 3. **MQTT connection issues**
@@ -298,7 +294,7 @@ The app provides detailed logging at different levels:
 ### Performance Tuning
 
 - **Thread Pool Size**: Default is 5 workers, adjust based on system resources
-- **Retry Settings**: Increase retries for unreliable networks
+
 - **File Retention**: Adjust `max_file_age_days` based on storage capacity
 - **Cache TTL**: Adjust `cache_ttl_hours` based on usage patterns
 - **Cooldown Periods**: Balance between responsiveness and notification spam

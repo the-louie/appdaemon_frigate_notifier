@@ -1,7 +1,7 @@
 """
 Frigate Notification App for AppDaemon
 
-Copyright (c) 2024 the_louie
+Copyright (c) 2025 the_louie
 All rights reserved.
 
 This app listens to Frigate MQTT events and sends notifications to configured users
@@ -216,8 +216,6 @@ class FrigateNotification(hass.Hass):
         self.cam_icons = self.args.get("cam_icons", {})
         self._load_person_configs()
 
-        self.max_retries = self.args.get("max_retries", 3)
-        self.retry_delay = self.args.get("retry_delay", 5)
         self.max_file_age_days = self.args.get("max_file_age_days", 30)
         self.enable_metrics = self.args.get("enable_metrics", True)
         self.cache_ttl_hours = self.args.get("cache_ttl_hours", 24)
@@ -401,12 +399,8 @@ class FrigateNotification(hass.Hass):
                 self.metrics.zone_filtered += 1
                 return
 
-            # Send notifications immediately, download video asynchronously
-            self._send_notifications(event_data, None)
-
-            # Download video in background if configured
-            if self.frigate_url and self.snapshot_dir:
-                self.executor.submit(self._download_video_clip, event_data.event_id, event_data.camera)
+            # Download media and send notifications
+            self.executor.submit(self._download_and_notify, event_data)
 
             processing_time = time.time() - start_time
             self.metrics.avg_processing_time = (
@@ -418,127 +412,92 @@ class FrigateNotification(hass.Hass):
             self.log(f"ERROR: Failed to process event: {e}", level="ERROR")
             self.metrics.errors += 1
 
-    def _download_video_clip(self, event_id: str, camera: str) -> Optional[str]:
-        """Download video clip from Frigate with retry logic and caching."""
-        self.log(f"DEBUG: Starting video download for event {event_id}, camera {camera}")
+    def _download_and_notify(self, event_data: EventData) -> None:
+        """Download media and send notifications."""
+        try:
+            # Try to download video first with 30s timeout and 2s retries
+            video_path = self._download_video_with_retry(event_data.event_id, event_data.camera)
 
+            if video_path:
+                self._send_notifications(event_data, video_path, "video")
+                return
+
+            # Fallback to snapshot if video download failed
+            snapshot_path = self._download_snapshot(event_data.event_id, event_data.camera)
+            if snapshot_path:
+                self._send_notifications(event_data, snapshot_path, "image")
+            else:
+                # Send notification without media if both downloads failed
+                self._send_notifications(event_data, None, None)
+
+        except Exception as e:
+            self.log(f"ERROR: Failed to download and notify for event {event_data.event_id}: {e}", level="ERROR")
+            self.metrics.errors += 1
+
+    def _download_video_with_retry(self, event_id: str, camera: str) -> Optional[str]:
+        """Download video with 30s timeout and 2s retries."""
+        start_time = time.time()
+        timeout = 30
+        retry_interval = 2
+
+        while time.time() - start_time < timeout:
+            try:
+                video_path = self._download_video_clip(event_id, camera)
+                if video_path:
+                    return video_path
+            except Exception as e:
+                self.log(f"ERROR: Video download attempt failed for event {event_id}: {e}", level="ERROR")
+                self.metrics.downloads_failed += 1
+
+            # Wait before retry
+            time.sleep(retry_interval)
+
+        self.log(f"Video download timeout after {timeout}s for event {event_id}")
+        return None
+
+    def _download_video_clip(self, event_id: str, camera: str) -> Optional[str]:
+        """Download video clip from Frigate."""
         cache_key = f"{event_id}_{camera}"
+
+        # Check cache first
         with self.cache_lock:
             if cache_key in self.file_cache:
                 cache_entry = self.file_cache[cache_key]
                 if (datetime.now() - cache_entry.timestamp).total_seconds() < self.cache_ttl_hours * 3600:
-                    self.log(f"DEBUG: Video found in cache for event {event_id}")
                     self.metrics.downloads_successful += 1
                     return cache_entry.file_path
-                else:
-                    self.log(f"DEBUG: Cache entry expired for event {event_id}")
 
-        for attempt in range(self.max_retries):
-            try:
-                self.log(f"DEBUG: Download attempt {attempt + 1}/{self.max_retries} for event {event_id}")
+        # Download new video
+        now = datetime.now()
+        timestamp = now.strftime("%Y%m%d_%H:%M:%S")
+        date_dir = now.strftime("%Y-%m-%d")
+        target_dir = self.snapshot_dir / camera / date_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
 
-                now = datetime.now()
-                timestamp = now.strftime("%Y%m%d_%H:%M:%S")
-                date_dir = now.strftime("%Y-%m-%d")
-                target_dir = self.snapshot_dir / camera / date_dir
+        filename = f"{timestamp}--{event_id}.mp4"
+        target_path = target_dir / filename
 
-                self.log(f"DEBUG: Creating target directory: {target_dir}")
-                target_dir.mkdir(parents=True, exist_ok=True)
+        if target_path.exists():
+            self._add_to_cache(cache_key, str(target_path), target_path.stat().st_size)
+            self.metrics.downloads_successful += 1
+            return f"{camera}/{date_dir}/{filename}"
 
-                filename = f"{timestamp}--{event_id}.mp4"
-                target_path = target_dir / filename
-                self.log(f"DEBUG: Target file path: {target_path}")
+        clip_url = f"{self.frigate_url}/{event_id}/clip.mp4"
+        req = urllib.request.Request(clip_url)
+        req.add_header('User-Agent', 'FrigateNotifier/1.0')
 
-                if target_path.exists():
-                    self.log(f"DEBUG: Video file already exists for event {event_id}")
-                    self._add_to_cache(cache_key, str(target_path), target_path.stat().st_size)
-                    self.metrics.downloads_successful += 1
-                    return f"{camera}/{date_dir}/{filename}"
+        with urllib.request.urlopen(req, timeout=self.connection_timeout) as response:
+            with open(target_path, 'wb') as f:
+                f.write(response.read())
 
-                clip_url = f"{self.frigate_url}/{event_id}/clip.mp4"
-                self.log(f"DEBUG: Downloading from URL: {clip_url}")
+        file_size = target_path.stat().st_size
+        self._add_to_cache(cache_key, str(target_path), file_size)
+        self.metrics.downloads_successful += 1
 
-                # Use urllib instead of requests to reduce dependencies
-                req = urllib.request.Request(clip_url)
-                req.add_header('User-Agent', 'FrigateNotifier/1.0')
-                self.log(f"DEBUG: Request headers: {dict(req.headers)}")
+        return f"{camera}/{date_dir}/{filename}"
 
-                self.log(f"DEBUG: Opening URL connection with timeout {self.connection_timeout}s")
-                with urllib.request.urlopen(req, timeout=self.connection_timeout) as response:
-                    self.log(f"DEBUG: Response status: {response.status}")
-                    self.log(f"DEBUG: Response headers: {dict(response.headers)}")
-
-                    content_length = response.headers.get('Content-Length')
-                    if content_length:
-                        self.log(f"DEBUG: Expected file size: {content_length} bytes")
-
-                    self.log(f"DEBUG: Starting file download to {target_path}")
-                    with open(target_path, 'wb') as f:
-                        data = response.read()
-                        f.write(data)
-                        self.log(f"DEBUG: Downloaded {len(data)} bytes")
-
-                file_size = target_path.stat().st_size
-                self.log(f"DEBUG: File saved successfully, size: {file_size} bytes")
-                self._add_to_cache(cache_key, str(target_path), file_size)
-                self.metrics.downloads_successful += 1
-
-                return f"{camera}/{date_dir}/{filename}"
-
-            except (urllib.error.URLError, urllib.error.HTTPError) as e:
-                self.log(f"DEBUG: Network error on attempt {attempt + 1}: {type(e).__name__}: {e}")
-                if hasattr(e, 'code'):
-                    self.log(f"DEBUG: HTTP status code: {e.code}")
-                if hasattr(e, 'reason'):
-                    self.log(f"DEBUG: Error reason: {e.reason}")
-                if hasattr(e, 'url'):
-                    self.log(f"DEBUG: Failed URL: {e.url}")
-
-                if attempt < self.max_retries - 1:
-                    self.log(f"DEBUG: Retrying in {self.retry_delay} seconds...")
-                    time.sleep(self.retry_delay)
-                else:
-                    self.log(f"DEBUG: All retry attempts exhausted for event {event_id}")
-
-            except Exception as e:
-                self.log(f"DEBUG: Unexpected error on attempt {attempt + 1}: {type(e).__name__}: {e}")
-                self.log(f"ERROR: Unexpected error downloading video clip: {e}", level="ERROR")
-                break
-
-        self.log(f"DEBUG: Video download failed for event {event_id} after {self.max_retries} attempts")
-        self.metrics.downloads_failed += 1
-        return None
-
-    def _wait_for_video_download(self, event_id: str, camera: str, timeout: int = 30) -> Optional[str]:
-        """Wait for video download to complete with timeout."""
-        start_time = time.time()
-        cache_key = f"{event_id}_{camera}"
-
-        while time.time() - start_time < timeout:
-            with self.cache_lock:
-                if cache_key in self.file_cache:
-                    cache_entry = self.file_cache[cache_key]
-                    if (datetime.now() - cache_entry.timestamp).total_seconds() < self.cache_ttl_hours * 3600:
-                        return cache_entry.file_path
-
-            # Check if file exists on disk
-            now = datetime.now()
-            date_dir = now.strftime("%Y-%m-%d")
-            target_dir = self.snapshot_dir / camera / date_dir
-            timestamp = now.strftime("%Y%m%d_%H:%M:%S")
-            filename = f"{timestamp}--{event_id}.mp4"
-            target_path = target_dir / filename
-
-            if target_path.exists():
-                self._add_to_cache(cache_key, str(target_path), target_path.stat().st_size)
-                return f"{camera}/{date_dir}/{filename}"
-
-            time.sleep(0.5)  # Check every 500ms
-
-        return None
-
-    def _download_thumbnail(self, event_id: str, camera: str) -> Optional[str]:
-        """Download thumbnail image from Frigate."""
+    def _download_snapshot(self, event_id: str, camera: str) -> Optional[str]:
+        """Download snapshot image from Frigate."""
         try:
             now = datetime.now()
             timestamp = now.strftime("%Y%m%d_%H:%M:%S")
@@ -553,8 +512,6 @@ class FrigateNotification(hass.Hass):
                 return f"{camera}/{date_dir}/{filename}"
 
             thumbnail_url = f"{self.frigate_url}/{event_id}/snapshot.jpg"
-
-            # Use urllib instead of requests to reduce dependencies
             req = urllib.request.Request(thumbnail_url)
             req.add_header('User-Agent', 'FrigateNotifier/1.0')
 
@@ -565,8 +522,7 @@ class FrigateNotification(hass.Hass):
             return f"{camera}/{date_dir}/{filename}"
 
         except Exception as e:
-            self.log(f"ERROR: Failed to download thumbnail for event {event_id}: {e}", level="ERROR")
-            self.log(f"       {thumbnail_url}")
+            self.log(f"ERROR: Failed to download snapshot for event {event_id}: {e}", level="ERROR")
             return None
 
     def _add_to_cache(self, cache_key: str, file_path: str, file_size: int) -> None:
@@ -580,92 +536,57 @@ class FrigateNotification(hass.Hass):
                 checksum=checksum
             )
 
-    def _send_notifications(self, event_data: EventData, event_url: Optional[str]) -> None:
+    def _send_notifications(self, event_data: EventData, media_path: Optional[str], media_type: Optional[str]) -> None:
         """Send notifications to configured persons."""
         timestamp = event_data.timestamp.strftime("%H:%M:%S")
         zone_str = ", ".join(event_data.entered_zones) if event_data.entered_zones else "No zones"
 
-        # Build notification data once and reuse
-        notification_data = self._build_notification_data(event_data.camera, event_url)
-
-        for person_config in self.person_configs:
-            if not person_config.enabled:
-                continue
-
-            self._send_person_notification(
-                person_config, event_data, zone_str, timestamp, notification_data
-            )
-
-    def _build_notification_data(self, camera: str, event_url: Optional[str]) -> Dict[str, Any]:
-        """Build notification data dictionary."""
-        base_data = {
+        # Build notification data
+        notification_data = {
             "actions": [{
                 "action": "URI",
                 "title": "Open Camera",
-                "uri": f"homeassistant://navigate/dashboard-kameror/{camera}"
+                "uri": f"homeassistant://navigate/dashboard-kameror/{event_data.camera}"
             }],
-            "channel": f"frigate-{camera}",
+            "channel": f"frigate-{event_data.camera}",
             "importance": "high",
             "visibility": "public",
             "priority": "high",
             "ttl": 0,
-            "notification_icon": self.cam_icons.get(camera, "mdi:cctv")
+            "notification_icon": self.cam_icons.get(event_data.camera, "mdi:cctv")
         }
 
-        if event_url and self.ext_domain:
-            base_data["video"] = f"{self.ext_domain}/local/frigate/{event_url}"
+        # Add media to notification
+        if media_path and self.ext_domain:
+            if media_type == "video":
+                notification_data["video"] = f"{self.ext_domain}/local/frigate/{media_path}"
+            elif media_type == "image":
+                notification_data["image"] = f"{self.ext_domain}/local/frigate/{media_path}"
 
-        return base_data
+        # Send to each configured person
+        for person_config in self.person_configs:
+            if not person_config.enabled:
+                continue
 
-    def _send_person_notification(self, person_config: PersonConfig, event_data: EventData,
-                                 zone_str: str, timestamp: str, notification_data: Dict[str, Any]) -> None:
-        """Send notification to a specific person."""
-        try:
             if person_config.cameras and event_data.camera not in person_config.cameras:
-                return
+                continue
 
             if person_config.zones and not any(zone in person_config.zones for zone in event_data.entered_zones):
-                return
+                continue
 
             if event_data.label not in person_config.labels:
                 self.metrics.label_filtered += 1
-                return
+                continue
 
             cooldown_key = f"{person_config.notify}/{event_data.camera}"
             last_msg_time = time.time() - self.msg_cooldown.get(cooldown_key, 0)
 
             if last_msg_time < person_config.cooldown:
                 self.metrics.cooldown_skipped += 1
-                return
+                continue
 
             title = f"{event_data.label} @ {event_data.camera}"
             message = f"{timestamp} - {zone_str} (ID: {event_data.event_id})"
-
-            # Check if video/image is attached and determine reason if not
-            has_attachment = "video" in notification_data
-            attachment_reason = "Video attached"
-
-            if not has_attachment:
-                if not self.frigate_url:
-                    attachment_reason = "No Frigate URL configured"
-                elif not self.snapshot_dir:
-                    attachment_reason = "No snapshot directory configured"
-                elif not self.ext_domain:
-                    attachment_reason = "No external domain configured"
-                else:
-                    # Wait for video download with timeout, fallback to thumbnail
-                    video_path = self._wait_for_video_download(event_data.event_id, event_data.camera, timeout=30)
-                    if video_path:
-                        notification_data["video"] = f"{self.ext_domain}/local/frigate/{video_path}"
-                        has_attachment = True
-                        attachment_reason = "Video attached (waited)"
-                    else:
-                        # Download thumbnail as fallback
-                        thumbnail_path = self._download_thumbnail(event_data.event_id, event_data.camera)
-                        if thumbnail_path:
-                            notification_data["image"] = f"{self.ext_domain}/local/frigate/{thumbnail_path}"
-                            has_attachment = True
-                            attachment_reason = "Thumbnail attached (video timeout)"
 
             self.call_service(
                 f"notify/{person_config.notify}",
@@ -676,11 +597,10 @@ class FrigateNotification(hass.Hass):
 
             self.msg_cooldown[cooldown_key] = time.time()
             self.metrics.notifications_sent += 1
-            self.log(f"Notification sent to {person_config.name} - {title} - Event ID: {event_data.event_id} - Attachment: {'Yes' if has_attachment else 'No'} - Reason: {attachment_reason}")
 
-        except Exception as e:
-            self.log(f"ERROR: Failed to send notification to {person_config.name}: {e}", level="ERROR")
-            self.metrics.errors += 1
+            # Log notification with media info
+            media_info = f" - {media_type}: {media_path}" if media_path else " - no media"
+            self.log(f"Notification sent to {person_config.name} - {title} - Event ID: {event_data.event_id}{media_info}")
 
     def _check_connection_health(self, kwargs: Dict[str, Any]) -> None:
         """Check and report connection health."""
@@ -720,7 +640,7 @@ class FrigateNotification(hass.Hass):
         try:
             cutoff_time = datetime.now() - timedelta(hours=self.cache_ttl_hours)
             expired_keys = []
-            max_cache_size = 1000  # Limit cache to prevent memory issues
+            max_cache_size = 1000
 
             with self.cache_lock:
                 # Remove expired entries
@@ -733,7 +653,6 @@ class FrigateNotification(hass.Hass):
 
                 # Limit cache size if needed
                 if len(self.file_cache) > max_cache_size:
-                    # Remove oldest entries
                     sorted_entries = sorted(self.file_cache.items(), key=lambda x: x[1].timestamp)
                     entries_to_remove = len(self.file_cache) - max_cache_size
                     for i in range(entries_to_remove):

@@ -19,8 +19,6 @@ frigate_notify:
   only_zones: true  # Only notify when objects enter zones
 
   # Advanced Settings
-  max_retries: 3           # Number of retry attempts for downloads
-  retry_delay: 5           # Seconds between retry attempts
   max_file_age_days: 30    # Days to keep video files before cleanup
   enable_metrics: true     # Enable metrics logging
 
