@@ -77,35 +77,35 @@ class FrigateNotification(hass.Hass):
         self.run_every(self._log_daily_metrics, datetime.now().replace(hour=23, minute=59, second=0, microsecond=0), 24 * 60 * 60)
         self.run_every(self._cleanup_cache, datetime.now(), 6 * 60 * 60)
 
-        self.log(f"Frigate Notifier initialized with {len(self.person_configs)} persons configured")
-
     def _load_config(self) -> None:
         """Load and validate configuration from args."""
-        self.mqtt_topic = self.args.get("mqtt_topic", "frigate/events")
+        # Early validation of required parameters
         self.frigate_url = self.args.get("frigate_url")
-        self.ext_domain = self.args.get("ext_domain")
-        self.snapshot_dir = self.args.get("snapshot_dir")
-
         if not self.frigate_url:
             self.log("ERROR: frigate_url is required", level="ERROR")
             return
 
+        self.ext_domain = self.args.get("ext_domain")
         if not self.ext_domain:
             self.log("ERROR: ext_domain is required", level="ERROR")
             return
 
+        # Load optional parameters
+        self.mqtt_topic = self.args.get("mqtt_topic", "frigate/events")
+        self.snapshot_dir = self.args.get("snapshot_dir")
+        self.only_zones = self.args.get("only_zones", False)
+        self.cam_icons = self.args.get("cam_icons", {})
+        self.max_file_age_days = self.args.get("max_file_age_days", 30)
+        self.cache_ttl_hours = self.args.get("cache_ttl_hours", 24)
+        self.connection_timeout = self.args.get("connection_timeout", 30)
+
+        # Setup snapshot directory if specified
         if self.snapshot_dir:
             self.snapshot_dir = Path(self.snapshot_dir)
             if not self.snapshot_dir.exists():
                 self.snapshot_dir.mkdir(parents=True, exist_ok=True)
 
-        self.only_zones = self.args.get("only_zones", False)
-        self.cam_icons = self.args.get("cam_icons", {})
         self._load_person_configs()
-
-        self.max_file_age_days = self.args.get("max_file_age_days", 30)
-        self.cache_ttl_hours = self.args.get("cache_ttl_hours", 24)
-        self.connection_timeout = self.args.get("connection_timeout", 30)
 
     def _load_person_configs(self) -> None:
         """Load and validate person configurations."""
@@ -164,15 +164,15 @@ class FrigateNotification(hass.Hass):
     def _handle_mqtt_message(self, event_name: str, data: Dict[str, Any], kwargs: Dict[str, Any]) -> None:
         """Handle incoming MQTT messages from Frigate."""
         try:
+            # Early validation
             if not data or 'topic' not in data or 'payload' not in data:
                 return
 
             topic = data['topic']
-            payload = data['payload']
-
             if not topic.startswith(self.mqtt_topic):
                 return
 
+            payload = data['payload']
             if isinstance(payload, str):
                 try:
                     payload = json.loads(payload)
@@ -184,6 +184,7 @@ class FrigateNotification(hass.Hass):
             if not event_data:
                 return
 
+            # Add to queue if space available
             with self.queue_lock:
                 if len(self.event_queue) < 1000:
                     self.event_queue.append(event_data)
@@ -232,11 +233,12 @@ class FrigateNotification(hass.Hass):
 
     def _create_cache_entry(self, cache_key: str, file_path: Path) -> Dict[str, Any]:
         """Create a cache entry for a file."""
+        file_size = file_path.stat().st_size
         return {
             "file_path": str(file_path),
             "timestamp": datetime.now(),
-            "size": file_path.stat().st_size,
-            "checksum": hashlib.md5(f"{cache_key}_{file_path.stat().st_size}".encode()).hexdigest()
+            "size": file_size,
+            "checksum": hashlib.md5(f"{cache_key}_{file_size}".encode()).hexdigest()
         }
 
     def _extract_event_data(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -273,7 +275,7 @@ class FrigateNotification(hass.Hass):
             if self.only_zones and not event_data["entered_zones"]:
                 return
 
-            # Download media and send notifications
+            # Submit download and notification work to thread pool
             self.executor.submit(self._download_and_notify, event_data)
 
         except Exception as e:
@@ -352,17 +354,27 @@ class FrigateNotification(hass.Hass):
 
     def _send_notifications(self, event_data: Dict[str, Any], media_path: Optional[str], media_type: Optional[str]) -> None:
         """Send notifications to configured persons."""
+        if not self.person_configs:
+            return
+
         notification_start = time.time()
         timestamp = event_data["timestamp"].strftime("%H:%M:%S")
-        zone_str = ", ".join(event_data["entered_zones"]) if event_data["entered_zones"] else "No zones"
         camera = event_data["camera"]
         event_id = event_data["event_id"]
         label = event_data["label"]
+        entered_zones = event_data["entered_zones"]
+        zone_str = ", ".join(entered_zones) if entered_zones else "No zones"
+
+        # Pre-build common strings
+        title = f"{label} @ {camera}"
+        message = f"{timestamp} - {zone_str} (ID: {event_id})"
+        camera_uri = f"homeassistant://navigate/dashboard-kameror/{camera}"
+        channel = f"frigate-{camera}"
 
         # Build base notification data
         notification_data = {
-            "actions": [{"action": "URI", "title": "Open Camera", "uri": f"homeassistant://navigate/dashboard-kameror/{camera}"}],
-            "channel": f"frigate-{camera}",
+            "actions": [{"action": "URI", "title": "Open Camera", "uri": camera_uri}],
+            "channel": channel,
             "importance": "high",
             "visibility": "public",
             "priority": "high",
@@ -381,10 +393,6 @@ class FrigateNotification(hass.Hass):
             elif media_type == "image":
                 notification_data["image"] = media_url
 
-        # Pre-build title and message
-        title = f"{label} @ {camera}"
-        message = f"{timestamp} - {zone_str} (ID: {event_id})"
-
         # Send to each configured person
         for person_config in self.person_configs:
             if not person_config["enabled"]:
@@ -393,7 +401,7 @@ class FrigateNotification(hass.Hass):
             if person_config["cameras"] and camera not in person_config["cameras"]:
                 continue
 
-            if person_config["zones"] and not any(zone in person_config["zones"] for zone in event_data["entered_zones"]):
+            if person_config["zones"] and not any(zone in person_config["zones"] for zone in entered_zones):
                 continue
 
             if label not in person_config["labels"]:
@@ -417,7 +425,7 @@ class FrigateNotification(hass.Hass):
         with self.metrics_lock:
             self.notification_times.append(notification_time)
 
-    def _log_daily_metrics(self, kwargs: Dict[str, Any]) -> None:
+    def _log_daily_metrics(self) -> None:
         """Log daily notification performance metrics."""
         try:
             with self.metrics_lock:
@@ -425,72 +433,65 @@ class FrigateNotification(hass.Hass):
                     self.log("METRICS: No notifications sent today")
                     return
 
-                # Calculate notification processing statistics
-                notification_stats = {}
+                # Calculate statistics
+                stats = {}
                 if self.notification_times:
-                    notification_stats = {
+                    stats.update({
                         "total_notifications": len(self.notification_times),
                         "min_seconds": round(min(self.notification_times), 3),
                         "avg_seconds": round(sum(self.notification_times) / len(self.notification_times), 3),
                         "max_seconds": round(max(self.notification_times), 3)
-                    }
+                    })
 
-                # Calculate delivery time statistics
-                delivery_stats = {}
                 if self.delivery_times:
-                    delivery_stats = {
+                    stats.update({
                         "total_deliveries": len(self.delivery_times),
                         "min_delivery_seconds": round(min(self.delivery_times), 3),
                         "avg_delivery_seconds": round(sum(self.delivery_times) / len(self.delivery_times), 3),
                         "max_delivery_seconds": round(max(self.delivery_times), 3)
-                    }
-
-                # Load previous day's metrics for comparison
-                yesterday_metrics = self._load_yesterday_metrics()
+                    })
 
                 # Prepare today's metrics
-                today_metrics = {
-                    "date": datetime.now().strftime("%Y-%m-%d"),
-                    **notification_stats,
-                    **delivery_stats
-                }
+                today_metrics = {"date": datetime.now().strftime("%Y-%m-%d"), **stats}
 
                 # Add comparison if yesterday's data exists
+                yesterday_metrics = self._load_yesterday_metrics()
                 if yesterday_metrics:
                     comparison = {}
-                    if notification_stats and "min_seconds" in yesterday_metrics:
-                        comparison["min_diff"] = round(notification_stats["min_seconds"] - yesterday_metrics["min_seconds"], 3)
-                        comparison["avg_diff"] = round(notification_stats["avg_seconds"] - yesterday_metrics["avg_seconds"], 3)
-                        comparison["max_diff"] = round(notification_stats["max_seconds"] - yesterday_metrics["max_seconds"], 3)
+                    if "min_seconds" in stats and "min_seconds" in yesterday_metrics:
+                        comparison.update({
+                            "min_diff": round(stats["min_seconds"] - yesterday_metrics["min_seconds"], 3),
+                            "avg_diff": round(stats["avg_seconds"] - yesterday_metrics["avg_seconds"], 3),
+                            "max_diff": round(stats["max_seconds"] - yesterday_metrics["max_seconds"], 3)
+                        })
 
-                    if delivery_stats and "min_delivery_seconds" in yesterday_metrics:
-                        comparison["min_delivery_diff"] = round(delivery_stats["min_delivery_seconds"] - yesterday_metrics["min_delivery_seconds"], 3)
-                        comparison["avg_delivery_diff"] = round(delivery_stats["avg_delivery_seconds"] - yesterday_metrics["avg_delivery_seconds"], 3)
-                        comparison["max_delivery_diff"] = round(delivery_stats["max_delivery_seconds"] - yesterday_metrics["max_delivery_seconds"], 3)
+                    if "min_delivery_seconds" in stats and "min_delivery_seconds" in yesterday_metrics:
+                        comparison.update({
+                            "min_delivery_diff": round(stats["min_delivery_seconds"] - yesterday_metrics["min_delivery_seconds"], 3),
+                            "avg_delivery_diff": round(stats["avg_delivery_seconds"] - yesterday_metrics["avg_delivery_seconds"], 3),
+                            "max_delivery_diff": round(stats["max_delivery_seconds"] - yesterday_metrics["max_delivery_seconds"], 3)
+                        })
 
                     if comparison:
                         today_metrics["comparison"] = comparison
 
-                # Save to file
+                # Save and log
                 self._save_metrics(today_metrics)
 
-                # Log metrics
+                # Log metrics summary
                 log_parts = ["METRICS:"]
-                if notification_stats:
-                    log_parts.append(f"Notifications={notification_stats['total_notifications']}, Min={notification_stats['min_seconds']}s, Avg={notification_stats['avg_seconds']}s, Max={notification_stats['max_seconds']}s")
-                if delivery_stats:
-                    log_parts.append(f"Deliveries={delivery_stats['total_deliveries']}, Min={delivery_stats['min_delivery_seconds']}s, Avg={delivery_stats['avg_delivery_seconds']}s, Max={delivery_stats['max_delivery_seconds']}s")
-
-                if yesterday_metrics and "comparison" in today_metrics:
-                    comp = today_metrics["comparison"]
+                if "total_notifications" in stats:
+                    log_parts.append(f"Notifications={stats['total_notifications']}, Min={stats['min_seconds']}s, Avg={stats['avg_seconds']}s, Max={stats['max_seconds']}s")
+                if "total_deliveries" in stats:
+                    log_parts.append(f"Deliveries={stats['total_deliveries']}, Min={stats['min_delivery_seconds']}s, Avg={stats['avg_delivery_seconds']}s, Max={stats['max_delivery_seconds']}s")
+                if comparison:
                     comp_parts = []
-                    if "min_diff" in comp:
-                        comp_parts.append(f"Min diff: {comp['min_diff']:+0.3f}s, Avg diff: {comp['avg_diff']:+0.3f}s, Max diff: {comp['max_diff']:+0.3f}s")
-                    if "min_delivery_diff" in comp:
-                        comp_parts.append(f"Delivery diff: Min {comp['min_delivery_diff']:+0.3f}s, Avg {comp['avg_delivery_diff']:+0.3f}s, Max {comp['max_delivery_diff']:+0.3f}s")
+                    if "min_diff" in comparison:
+                        comp_parts.append(f"Min diff: {comparison['min_diff']:+0.3f}s, Avg diff: {comparison['avg_diff']:+0.3f}s, Max diff: {comparison['max_diff']:+0.3f}s")
+                    if "min_delivery_diff" in comparison:
+                        comp_parts.append(f"Delivery diff: Min {comparison['min_delivery_diff']:+0.3f}s, Avg {comparison['avg_delivery_diff']:+0.3f}s, Max {comparison['max_delivery_diff']:+0.3f}s")
                     if comp_parts:
                         log_parts.append(" | ".join(comp_parts))
-
                 self.log(" | ".join(log_parts))
 
                 # Clear today's data for next day
@@ -544,17 +545,17 @@ class FrigateNotification(hass.Hass):
         except Exception as e:
             self.log(f"ERROR: Failed to save metrics: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
-    def _cleanup_old_files(self, kwargs: Dict[str, Any]) -> None:
+    def _cleanup_old_files(self) -> None:
         """Clean up old video files to prevent disk space issues."""
         if not self.snapshot_dir or not self.snapshot_dir.exists():
             return
 
         try:
-            cutoff_date = datetime.now() - timedelta(days=self.max_file_age_days)
+            cutoff_time = datetime.now() - timedelta(days=self.max_file_age_days)
             files_removed = 0
 
             for file_path in self.snapshot_dir.rglob("*.mp4"):
-                if file_path.stat().st_mtime < cutoff_date.timestamp():
+                if file_path.stat().st_mtime < cutoff_time.timestamp():
                     file_path.unlink()
                     files_removed += 1
 
@@ -564,25 +565,21 @@ class FrigateNotification(hass.Hass):
         except Exception as e:
             self.log(f"ERROR: Failed to cleanup old files: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
-    def _cleanup_cache(self, kwargs: Dict[str, Any]) -> None:
+    def _cleanup_cache(self) -> None:
         """Clean up expired cache entries and limit cache size."""
         try:
             cutoff_time = datetime.now() - timedelta(hours=self.cache_ttl_hours)
 
             with self.cache_lock:
-                # Find expired entries
-                expired_keys = [key for key, entry in self.file_cache.items() if entry["timestamp"] < cutoff_time]
-
                 # Remove expired entries
+                expired_keys = [key for key, entry in self.file_cache.items() if entry["timestamp"] < cutoff_time]
                 for key in expired_keys:
                     del self.file_cache[key]
 
                 # Limit cache size if needed
                 if len(self.file_cache) > 1000:
-                    # Sort by timestamp and remove oldest entries
                     sorted_entries = sorted(self.file_cache.items(), key=lambda x: x[1]["timestamp"])
-                    entries_to_remove = len(self.file_cache) - 1000
-                    for i in range(entries_to_remove):
+                    for i in range(len(self.file_cache) - 1000):
                         del self.file_cache[sorted_entries[i][0]]
 
             if expired_keys:
