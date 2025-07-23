@@ -5,7 +5,11 @@
       "total_notifications": 15,
       "min_seconds": 0.245,
       "avg_seconds": 0.523,
-      "max_seconds": 1.234
+      "max_seconds": 1.234,
+      "total_deliveries": 12,
+      "min_delivery_seconds": 2.1,
+      "avg_delivery_seconds": 3.45,
+      "max_delivery_seconds": 8.2
     },
     {
       "date": "2025-01-21",
@@ -13,10 +17,17 @@
       "min_seconds": 0.198,
       "avg_seconds": 0.456,
       "max_seconds": 0.987,
+      "total_deliveries": 10,
+      "min_delivery_seconds": 1.8,
+      "avg_delivery_seconds": 3.12,
+      "max_delivery_seconds": 7.5,
       "comparison": {
         "min_diff": -0.047,
         "avg_diff": -0.067,
-        "max_diff": -0.247
+        "max_diff": -0.247,
+        "min_delivery_diff": -0.3,
+        "avg_delivery_diff": -0.33,
+        "max_delivery_diff": -0.7
       }
     }
   ]
