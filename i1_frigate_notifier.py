@@ -281,8 +281,12 @@ class FrigateNotification(hass.Hass):
         try:
             self.log(f"DEBUG[{event_suffix}]: Processing event - ID: {event_id}, Type: {event_data['event_type']}, Camera: {event_data['camera']}, Label: {event_data['label']}")
 
-            if not event_data["event_id"] or event_data["event_type"] != "end":
-                self.log(f"DEBUG[{event_suffix}]: Skipping event - invalid ID or not 'end' type")
+            if not event_data["event_id"]:
+                self.log(f"DEBUG[{event_suffix}]: Skipping event - invalid event ID")
+                return
+
+            if event_data["event_type"] != "end":
+                self.log(f"DEBUG[{event_suffix}]: Skipping event - not 'end' type (got: {event_data['event_type']})")
                 return
 
             if self.only_zones and not event_data["entered_zones"]:
