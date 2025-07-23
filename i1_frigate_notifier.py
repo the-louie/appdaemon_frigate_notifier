@@ -184,10 +184,17 @@ class FrigateNotification(hass.Hass):
             if not event_data:
                 return
 
+            event_id = event_data["event_id"]
+            event_suffix = event_id.split('-')[-1] if '-' in event_id else event_id
+            self.log(f"DEBUG[{event_suffix}]: MQTT event received - Topic: {topic}, Event ID: {event_id}")
+
             # Add to queue if space available
             with self.queue_lock:
                 if len(self.event_queue) < 1000:
                     self.event_queue.append(event_data)
+                    self.log(f"DEBUG[{event_suffix}]: Event added to queue (queue size: {len(self.event_queue)})")
+                else:
+                    self.log(f"DEBUG[{event_suffix}]: Event queue full, dropping event")
 
         except Exception as e:
             self.log(f"ERROR: Failed to process MQTT message: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
@@ -268,13 +275,21 @@ class FrigateNotification(hass.Hass):
 
     def _process_event(self, event_data: Dict[str, Any]) -> None:
         """Process a Frigate event."""
+        event_id = event_data["event_id"]
+        event_suffix = event_id.split('-')[-1] if '-' in event_id else event_id
+
         try:
+            self.log(f"DEBUG[{event_suffix}]: Processing event - ID: {event_id}, Type: {event_data['event_type']}, Camera: {event_data['camera']}, Label: {event_data['label']}")
+
             if not event_data["event_id"] or event_data["event_type"] != "end":
+                self.log(f"DEBUG[{event_suffix}]: Skipping event - invalid ID or not 'end' type")
                 return
 
             if self.only_zones and not event_data["entered_zones"]:
+                self.log(f"DEBUG[{event_suffix}]: Skipping event - only_zones enabled but no zones entered")
                 return
 
+            self.log(f"DEBUG[{event_suffix}]: Event passed validation, submitting to thread pool for media download")
             # Submit download and notification work to thread pool
             self.executor.submit(self._download_and_notify, event_data)
 
@@ -283,84 +298,144 @@ class FrigateNotification(hass.Hass):
 
     def _download_and_notify(self, event_data: Dict[str, Any]) -> None:
         """Download media and send notifications."""
+        event_id = event_data["event_id"]
+        event_suffix = event_id.split('-')[-1] if '-' in event_id else event_id
+
         try:
+            self.log(f"DEBUG[{event_suffix}]: Starting media download and notification process")
+
             # Try video first with 30s timeout and 3s retries
-            media_path = self._download_media_with_retry(event_data["event_id"], event_data["camera"], "clip.mp4", ".mp4", 30, 3)
+            self.log(f"DEBUG[{event_suffix}]: Attempting video download (clip.mp4)")
+            media_path = self._download_media_with_retry(event_data["event_id"], event_data["camera"], "clip.mp4", ".mp4", 30, 3, event_suffix)
             if media_path:
-                self._send_notifications(event_data, media_path, "video")
+                self.log(f"DEBUG[{event_suffix}]: Video download successful: {media_path}")
+                self._send_notifications(event_data, media_path, "video", event_suffix)
                 return
 
             # If video fails, try snapshot with 15s timeout and 2s retries
-            media_path = self._download_media_with_retry(event_data["event_id"], event_data["camera"], "snapshot.jpg", ".jpg", 15, 2)
+            self.log(f"DEBUG[{event_suffix}]: Video failed, attempting snapshot download (snapshot.jpg)")
+            media_path = self._download_media_with_retry(event_data["event_id"], event_data["camera"], "snapshot.jpg", ".jpg", 15, 2, event_suffix)
             if media_path:
-                self._send_notifications(event_data, media_path, "image")
+                self.log(f"DEBUG[{event_suffix}]: Snapshot download successful: {media_path}")
+                self._send_notifications(event_data, media_path, "image", event_suffix)
                 return
 
             # Send notification without media if both downloads failed
-            self._send_notifications(event_data, None, None)
+            self.log(f"DEBUG[{event_suffix}]: Both video and snapshot downloads failed, sending notification without media")
+            self._send_notifications(event_data, None, None, event_suffix)
 
         except Exception as e:
-            self.log(f"ERROR: Failed to download and notify for event {event_data['event_id']}: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
+            self.log(f"ERROR: Failed to download and notify for event {event_id}: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
-    def _download_media_with_retry(self, event_id: str, camera: str, endpoint: str, extension: str, timeout: int, retry_interval: int) -> Optional[str]:
+    def _download_media_with_retry(self, event_id: str, camera: str, endpoint: str, extension: str, timeout: int, retry_interval: int, event_suffix: str) -> Optional[str]:
         """Download media with configurable timeout and retry interval."""
         start_time = time.time()
+        attempt = 0
+
+        self.log(f"DEBUG[{event_suffix}]: Starting {endpoint} download with {timeout}s timeout, {retry_interval}s retry interval")
+
         while time.time() - start_time < timeout:
+            attempt += 1
+            elapsed = time.time() - start_time
+
             try:
-                media_path = self._download_media(event_id, camera, endpoint, extension)
+                self.log(f"DEBUG[{event_suffix}]: {endpoint} download attempt {attempt} (elapsed: {elapsed:.1f}s)")
+                media_path = self._download_media(event_id, camera, endpoint, extension, event_suffix)
                 if media_path:
+                    self.log(f"DEBUG[{event_suffix}]: {endpoint} download successful on attempt {attempt} after {elapsed:.1f}s")
                     return media_path
+                else:
+                    self.log(f"DEBUG[{event_suffix}]: {endpoint} download returned None on attempt {attempt}")
             except Exception as e:
                 self.log(f"ERROR: Media download attempt failed for event {event_id} ({endpoint}): {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
-            time.sleep(retry_interval)
 
-        self.log(f"Media download timeout after {timeout}s for event {event_id} ({endpoint})")
+            if time.time() - start_time < timeout:
+                self.log(f"DEBUG[{event_suffix}]: Waiting {retry_interval}s before next {endpoint} attempt")
+                time.sleep(retry_interval)
+
+        self.log(f"DEBUG[{event_suffix}]: {endpoint} download timeout after {timeout}s ({attempt} attempts)")
         return None
 
-    def _download_media(self, event_id: str, camera: str, endpoint: str, extension: str) -> Optional[str]:
+    def _download_media(self, event_id: str, camera: str, endpoint: str, extension: str, event_suffix: str) -> Optional[str]:
         """Download media file from Frigate."""
         cache_key = f"{event_id}_{camera}_{endpoint}"
+
+        self.log(f"DEBUG[{event_suffix}]: Checking cache for {endpoint} (key: {cache_key})")
 
         # Check cache first
         with self.cache_lock:
             if cache_key in self.file_cache:
                 cache_entry = self.file_cache[cache_key]
-                if (datetime.now() - cache_entry["timestamp"]).total_seconds() < self.cache_ttl_hours * 3600:
+                cache_age = (datetime.now() - cache_entry["timestamp"]).total_seconds()
+                if cache_age < self.cache_ttl_hours * 3600:
+                    self.log(f"DEBUG[{event_suffix}]: {endpoint} found in cache (age: {cache_age:.1f}s), returning: {cache_entry['file_path']}")
                     return cache_entry["file_path"]
+                else:
+                    self.log(f"DEBUG[{event_suffix}]: {endpoint} cache entry expired (age: {cache_age:.1f}s)")
+            else:
+                self.log(f"DEBUG[{event_suffix}]: {endpoint} not found in cache")
 
         # Download new media
         now = datetime.now()
         timestamp = now.strftime("%Y%m%d_%H:%M:%S")
         date_dir = now.strftime("%Y-%m-%d")
         target_dir = self.snapshot_dir / camera / date_dir
+
+        self.log(f"DEBUG[{event_suffix}]: Creating target directory: {target_dir}")
         target_dir.mkdir(parents=True, exist_ok=True)
 
         filename = f"{timestamp}--{event_id}{extension}"
         target_path = target_dir / filename
 
+        self.log(f"DEBUG[{event_suffix}]: Target file path: {target_path}")
+
         if target_path.exists():
+            self.log(f"DEBUG[{event_suffix}]: {endpoint} file already exists, adding to cache")
             # Add to cache inline
             with self.cache_lock:
                 self.file_cache[cache_key] = self._create_cache_entry(cache_key, target_path)
-            return f"{camera}/{date_dir}/{filename}"
+            relative_path = f"{camera}/{date_dir}/{filename}"
+            self.log(f"DEBUG[{event_suffix}]: Returning existing {endpoint} file: {relative_path}")
+            return relative_path
 
         media_url = f"{self.frigate_url}/{event_id}/{endpoint}"
+        self.log(f"DEBUG[{event_suffix}]: Downloading {endpoint} from URL: {media_url}")
+
         req = urllib.request.Request(media_url)
         req.add_header('User-Agent', 'FrigateNotifier/1.0')
 
-        with urllib.request.urlopen(req, timeout=self.connection_timeout) as response:
-            with open(target_path, 'wb') as f:
-                f.write(response.read())
+        try:
+            with urllib.request.urlopen(req, timeout=self.connection_timeout) as response:
+                self.log(f"DEBUG[{event_suffix}]: {endpoint} HTTP response received (status: {response.status})")
+                with open(target_path, 'wb') as f:
+                    content = response.read()
+                    file_size = len(content)
+                self.log(f"DEBUG[{event_suffix}]: {endpoint} downloaded successfully ({file_size} bytes)")
 
-        # Add to cache inline
-        with self.cache_lock:
-            self.file_cache[cache_key] = self._create_cache_entry(cache_key, target_path)
-        return f"{camera}/{date_dir}/{filename}"
+            # Add to cache inline
+            with self.cache_lock:
+                self.file_cache[cache_key] = self._create_cache_entry(cache_key, target_path)
 
-    def _send_notifications(self, event_data: Dict[str, Any], media_path: Optional[str], media_type: Optional[str]) -> None:
+            relative_path = f"{camera}/{date_dir}/{filename}"
+            self.log(f"DEBUG[{event_suffix}]: {endpoint} download complete, returning: {relative_path}")
+            return relative_path
+
+        except Exception as e:
+            self.log(f"DEBUG[{event_suffix}]: {endpoint} download failed: {e}")
+            # Clean up partial file if it exists
+            if target_path.exists():
+                target_path.unlink()
+                self.log(f"DEBUG[{event_suffix}]: Removed partial {endpoint} file")
+            raise
+
+    def _send_notifications(self, event_data: Dict[str, Any], media_path: Optional[str], media_type: Optional[str], event_suffix: str) -> None:
         """Send notifications to configured persons."""
         if not self.person_configs:
+            self.log(f"DEBUG[{event_suffix}]: No person configs found, skipping notifications")
             return
+
+        self.log(f"DEBUG[{event_suffix}]: Starting notification sending process")
+        self.log(f"DEBUG[{event_suffix}]: Media path: {media_path}, Media type: {media_type}")
 
         notification_start = time.time()
         timestamp = event_data["timestamp"].strftime("%H:%M:%S")
@@ -375,6 +450,8 @@ class FrigateNotification(hass.Hass):
         message = f"{timestamp} - {zone_str} (ID: {event_id})"
         camera_uri = f"homeassistant://navigate/dashboard-kameror/{camera}"
         channel = f"frigate-{camera}"
+
+        self.log(f"DEBUG[{event_suffix}]: Built notification strings - Title: {title}, Channel: {channel}")
 
         # Build base notification data
         notification_data = {
@@ -395,40 +472,58 @@ class FrigateNotification(hass.Hass):
             media_url = f"{self.ext_domain}/local/frigate/{media_path}"
             if media_type == "video":
                 notification_data["video"] = media_url
+                self.log(f"DEBUG[{event_suffix}]: Added video to notification: {media_url}")
             elif media_type == "image":
                 notification_data["image"] = media_url
+                self.log(f"DEBUG[{event_suffix}]: Added image to notification: {media_url}")
+        else:
+            self.log(f"DEBUG[{event_suffix}]: No media attached to notification (media_path: {media_path}, ext_domain: {self.ext_domain})")
+
+        self.log(f"DEBUG[{event_suffix}]: Final notification data keys: {list(notification_data.keys())}")
 
         # Send to each configured person
+        notifications_sent = 0
         for person_config in self.person_configs:
             if not person_config["enabled"]:
+                self.log(f"DEBUG[{event_suffix}]: Skipping {person_config['name']} - disabled")
                 continue
 
             if person_config["cameras"] and camera not in person_config["cameras"]:
+                self.log(f"DEBUG[{event_suffix}]: Skipping {person_config['name']} - camera {camera} not in allowed cameras")
                 continue
 
             if person_config["zones"] and not any(zone in person_config["zones"] for zone in entered_zones):
+                self.log(f"DEBUG[{event_suffix}]: Skipping {person_config['name']} - no matching zones")
                 continue
 
             if label not in person_config["labels"]:
+                self.log(f"DEBUG[{event_suffix}]: Skipping {person_config['name']} - label {label} not in allowed labels")
                 continue
 
             cooldown_key = f"{person_config['notify']}/{camera}"
             last_msg_time = time.time() - self.msg_cooldown.get(cooldown_key, 0)
 
             if last_msg_time < person_config["cooldown"]:
+                self.log(f"DEBUG[{event_suffix}]: Skipping {person_config['name']} - cooldown active ({last_msg_time:.1f}s < {person_config['cooldown']}s)")
                 continue
 
+            self.log(f"DEBUG[{event_suffix}]: Sending notification to {person_config['name']} via {person_config['notify']}")
             self.call_service(f"notify/{person_config['notify']}", title=title, message=message, data=notification_data)
             self.msg_cooldown[cooldown_key] = time.time()
+            notifications_sent += 1
 
             # Log notification with media info
             media_info = f" - {media_type}: {media_path}" if media_path else " - no media"
             self.log(f"Notification sent to {person_config['name']} - {title} - Event ID: {event_id}{media_info}")
 
+        self.log(f"DEBUG[{event_suffix}]: Sent {notifications_sent} notifications total")
+
         # Record notification time
         notification_time = time.time() - notification_start
         with self.metrics_lock:
             self.notification_times.append(notification_time)
+
+        self.log(f"DEBUG[{event_suffix}]: Notification process completed in {notification_time:.3f}s")
 
     def _log_daily_metrics(self) -> None:
         """Log daily notification performance metrics."""
