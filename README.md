@@ -21,10 +21,9 @@ A sophisticated AppDaemon application that listens to Frigate MQTT events and se
 - **File Cleanup**: Automatic cleanup of old video files
 - **Metrics Tracking**: Comprehensive metrics for monitoring
 - **Memory Management**: Efficient memory usage with structured data
-- **Priority System**: Smart event prioritization based on zones and labels
 - **Intelligent Caching**: Prevents duplicate downloads with TTL-based cache
 - **Connection Monitoring**: Real-time MQTT connection health tracking
-- **Event Queue**: Priority-based event processing queue
+- **Event Queue**: Efficient event processing queue
 
 ## Installation
 
@@ -68,7 +67,6 @@ frigate_notify:
         - "car"
         - "truck"
       cooldown: 120  # 2 minutes
-      priority: "high"  # Priority level: low, normal, high, critical
       enabled: true     # Enable/disable notifications for this user
       zones:
         - "driveway"
@@ -82,7 +80,6 @@ frigate_notify:
       labels:
         - "person"
       cooldown: 300  # 5 minutes
-      priority: "normal"
       enabled: true
       # No zone/camera filters - will receive all person events
 ```
@@ -121,7 +118,6 @@ frigate_notify:
 | `notify` | string | Yes | Home Assistant notify service |
 | `labels` | list | Yes | List of object labels to notify about |
 | `cooldown` | integer | No | Cooldown period in seconds (default: 0) |
-| `priority` | string | No | Priority level: low, normal, high, critical (default: normal) |
 | `enabled` | boolean | No | Enable/disable notifications (default: true) |
 | `zones` | list | No | Specific zones to monitor (optional) |
 | `cameras` | list | No | Specific cameras to monitor (optional) |
@@ -130,8 +126,7 @@ frigate_notify:
 
 1. **Event Detection**: The app listens to MQTT messages from Frigate
 2. **Event Processing**: Only processes 'end' events to avoid duplicate notifications
-3. **Priority Assignment**: Automatically determines event priority based on zones and labels
-4. **Queue Management**: Events are queued with priority ordering for processing
+3. **Event Processing**: Events are queued for efficient processing
 4. **Zone Filtering**: If `only_zones` is enabled, skips events without zone entries
 5. **Media Download**: Downloads video clips with 30s timeout and 2s retries, falls back to snapshots
 6. **User Filtering**: Checks each user's preferences (labels, zones, cameras, cooldown, priority)
@@ -141,16 +136,11 @@ frigate_notify:
 
 ## Advanced Features
 
-### Priority System
-- **Smart Priority Detection**: Automatically determines priority based on zones and labels
-- **Critical Zones**: Front door, driveway, and entrance events get highest priority
-- **High Priority Labels**: Person, car, and truck events get high priority
-- **Priority Queue**: Critical events processed first, with intelligent queue management
-- **User Priority Levels**: Each user can have different priority settings
+
 
 ### Event Queue Management
-- **Thread-Safe Queue**: Priority-based event queue with proper synchronization
-- **Queue Overflow Protection**: Drops lowest priority events when queue is full
+- **Thread-Safe Queue**: Event queue with proper synchronization
+- **Queue Overflow Protection**: Drops events when queue is full
 - **Dedicated Processing Thread**: Separate thread for event processing
 - **Graceful Shutdown**: Proper cleanup of threads and resources
 
@@ -223,7 +213,6 @@ frigate_notify:
 - **Thread Pool**: Concurrent video downloads (5 workers)
 - **Memory Management**: Efficient memory usage with proper cleanup
 - **Async Processing**: Non-blocking event handling
-- **Priority Queue**: Efficient event ordering and processing
 - **Intelligent Caching**: Reduces redundant downloads
 
 ## Monitoring and Metrics

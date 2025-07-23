@@ -62,6 +62,10 @@ class FrigateNotification(hass.Hass):
         self.metrics_lock = threading.Lock()
         self.metrics_file = Path(__file__).parent / "notification_metrics.json"
 
+        # Event tracking for early notification
+        self.tracked_events = {}  # event_id -> {start_time, last_check, handled}
+        self.event_tracking_lock = threading.Lock()
+
         self._load_config()
         self._setup_mqtt()
 
@@ -72,10 +76,15 @@ class FrigateNotification(hass.Hass):
         self.processing_thread = threading.Thread(target=self._event_processing_worker, name="EventProcessor", daemon=True)
         self.processing_thread.start()
 
+        # Start event tracking thread for early clip checking
+        self.event_tracking_thread = threading.Thread(target=self._event_tracking_worker, name="EventTracker", daemon=True)
+        self.event_tracking_thread.start()
+
         # Schedule periodic tasks
         self.run_every(self._cleanup_old_files, datetime.now(), 24 * 60 * 60)
         self.run_every(self._log_daily_metrics, datetime.now().replace(hour=23, minute=59, second=0, microsecond=0), 24 * 60 * 60)
         self.run_every(self._cleanup_cache, datetime.now(), 6 * 60 * 60)
+        self.run_every(self._cleanup_old_tracked_events, datetime.now(), 5 * 60)  # Every 5 minutes
 
     def _load_config(self) -> None:
         """Load and validate configuration from args."""
@@ -161,6 +170,75 @@ class FrigateNotification(hass.Hass):
             except Exception as e:
                 self.log(f"ERROR: Event processing worker error: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
+    def _event_tracking_worker(self) -> None:
+        """Worker thread for tracking event ages and checking for early clip availability."""
+        while not self.shutdown_event.is_set():
+            try:
+                current_time = time.time()
+                events_to_check = []
+
+                # Get events that need checking
+                with self.event_tracking_lock:
+                    tracked_count = len(self.tracked_events)
+                    for event_id, event_data in self.tracked_events.items():
+                        if event_data["handled"]:
+                            continue
+
+                        age = current_time - event_data["start_time"]
+                        if age >= 35 and (current_time - event_data["last_check"]) >= 5:
+                            events_to_check.append((event_id, event_data))
+                            event_data["last_check"] = current_time
+
+                # Log tracking status periodically
+                if tracked_count > 0 and len(events_to_check) > 0:
+                    self.log(f"DEBUG: Tracking {tracked_count} events, checking {len(events_to_check)} for clip availability")
+
+                # Check each event for clip availability
+                for event_id, event_data in events_to_check:
+                    self._check_event_clip_availability(event_id, event_data)
+
+                time.sleep(1)  # Check every second
+
+            except Exception as e:
+                self.log(f"ERROR: Event tracking worker error: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
+
+    def _check_event_clip_availability(self, event_id: str, event_data: Dict[str, Any]) -> None:
+        """Check if a clip.mp4 is available for an event and trigger notification if so."""
+        event_suffix = event_id.split('-')[-1] if '-' in event_id else event_id
+        age = time.time() - event_data["start_time"]
+
+        self.log(f"DEBUG[{event_suffix}]: Checking clip availability for event (age: {age:.1f}s)")
+
+        try:
+            # Try to download the clip with a single attempt
+            media_path = self._download_media(event_id, event_data["camera"], "clip.mp4", ".mp4", event_suffix)
+
+            if media_path:
+                self.log(f"DEBUG[{event_suffix}]: Clip available! Triggering early notification")
+
+                # Mark as handled
+                with self.event_tracking_lock:
+                    event_data["handled"] = True
+
+                # Create event data and send notification
+                event_data_for_notification = {
+                    "event_id": event_id,
+                    "camera": event_data["camera"],
+                    "label": event_data["label"],
+                    "entered_zones": event_data["entered_zones"],
+                    "event_type": "end",
+                    "timestamp": datetime.fromtimestamp(event_data["start_time"])
+                }
+
+                # Send notification with video
+                self._send_notifications(event_data_for_notification, media_path, "video", event_suffix)
+
+            else:
+                self.log(f"DEBUG[{event_suffix}]: Clip not yet available, will check again in 5s")
+
+        except Exception as e:
+            self.log(f"ERROR: Failed to check clip availability for event {event_id}: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
+
     def _handle_mqtt_message(self, event_name: str, data: Dict[str, Any], kwargs: Dict[str, Any]) -> None:
         """Handle incoming MQTT messages from Frigate."""
         try:
@@ -186,15 +264,50 @@ class FrigateNotification(hass.Hass):
 
             event_id = event_data["event_id"]
             event_suffix = event_id.split('-')[-1] if '-' in event_id else event_id
-            self.log(f"DEBUG[{event_suffix}]: MQTT event received - Topic: {topic}, Event ID: {event_id}")
+            event_type = event_data["event_type"]
 
-            # Add to queue if space available
-            with self.queue_lock:
-                if len(self.event_queue) < 1000:
-                    self.event_queue.append(event_data)
-                    self.log(f"DEBUG[{event_suffix}]: Event added to queue (queue size: {len(self.event_queue)})")
+            self.log(f"DEBUG[{event_suffix}]: MQTT event received - Topic: {topic}, Event ID: {event_id}, Type: {event_type}")
+
+            # Track all events for age monitoring
+            with self.event_tracking_lock:
+                if event_id not in self.tracked_events:
+                    # New event - start tracking
+                    self.tracked_events[event_id] = {
+                        "start_time": time.time(),
+                        "last_check": 0,
+                        "handled": False,
+                        "camera": event_data["camera"],
+                        "label": event_data["label"],
+                        "entered_zones": event_data["entered_zones"]
+                    }
+                    self.log(f"DEBUG[{event_suffix}]: Started tracking event (type: {event_type})")
                 else:
-                    self.log(f"DEBUG[{event_suffix}]: Event queue full, dropping event")
+                    # Update existing event data
+                    self.tracked_events[event_id].update({
+                        "camera": event_data["camera"],
+                        "label": event_data["label"],
+                        "entered_zones": event_data["entered_zones"]
+                    })
+
+                # Check if event is already handled
+                if self.tracked_events[event_id]["handled"]:
+                    self.log(f"DEBUG[{event_suffix}]: Event already handled, skipping")
+                    return
+
+            # For end events, process immediately
+            if event_type == "end":
+                self.log(f"DEBUG[{event_suffix}]: End event received, processing immediately")
+                # Mark as handled
+                with self.event_tracking_lock:
+                    self.tracked_events[event_id]["handled"] = True
+
+                # Add to queue for processing
+                with self.queue_lock:
+                    if len(self.event_queue) < 1000:
+                        self.event_queue.append(event_data)
+                        self.log(f"DEBUG[{event_suffix}]: End event added to queue (queue size: {len(self.event_queue)})")
+                    else:
+                        self.log(f"DEBUG[{event_suffix}]: Event queue full, dropping end event")
 
         except Exception as e:
             self.log(f"ERROR: Failed to process MQTT message: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
@@ -280,10 +393,6 @@ class FrigateNotification(hass.Hass):
 
         try:
             self.log(f"DEBUG[{event_suffix}]: Processing event - ID: {event_id}, Type: {event_data['event_type']}, Camera: {event_data['camera']}, Label: {event_data['label']}")
-
-            if not event_data["event_id"]:
-                self.log(f"DEBUG[{event_suffix}]: Skipping event - invalid event ID")
-                return
 
             if event_data["event_type"] != "end":
                 self.log(f"DEBUG[{event_suffix}]: Skipping event - not 'end' type (got: {event_data['event_type']})")
@@ -395,9 +504,7 @@ class FrigateNotification(hass.Hass):
 
         if target_path.exists():
             self.log(f"DEBUG[{event_suffix}]: {endpoint} file already exists, adding to cache")
-            # Add to cache inline
-            with self.cache_lock:
-                self.file_cache[cache_key] = self._create_cache_entry(cache_key, target_path)
+            self._add_to_cache(cache_key, target_path)
             relative_path = f"{camera}/{date_dir}/{filename}"
             self.log(f"DEBUG[{event_suffix}]: Returning existing {endpoint} file: {relative_path}")
             return relative_path
@@ -411,14 +518,15 @@ class FrigateNotification(hass.Hass):
         try:
             with urllib.request.urlopen(req, timeout=self.connection_timeout) as response:
                 self.log(f"DEBUG[{event_suffix}]: {endpoint} HTTP response received (status: {response.status})")
+                content = response.read()
+                file_size = len(content)
+
                 with open(target_path, 'wb') as f:
-                    content = response.read()
-                    file_size = len(content)
+                    f.write(content)
+
                 self.log(f"DEBUG[{event_suffix}]: {endpoint} downloaded successfully ({file_size} bytes)")
 
-            # Add to cache inline
-            with self.cache_lock:
-                self.file_cache[cache_key] = self._create_cache_entry(cache_key, target_path)
+            self._add_to_cache(cache_key, target_path)
 
             relative_path = f"{camera}/{date_dir}/{filename}"
             self.log(f"DEBUG[{event_suffix}]: {endpoint} download complete, returning: {relative_path}")
@@ -431,6 +539,11 @@ class FrigateNotification(hass.Hass):
                 target_path.unlink()
                 self.log(f"DEBUG[{event_suffix}]: Removed partial {endpoint} file")
             raise
+
+    def _add_to_cache(self, cache_key: str, file_path: Path) -> None:
+        """Add file to cache with proper locking."""
+        with self.cache_lock:
+            self.file_cache[cache_key] = self._create_cache_entry(cache_key, file_path)
 
     def _send_notifications(self, event_data: Dict[str, Any], media_path: Optional[str], media_type: Optional[str], event_suffix: str) -> None:
         """Send notifications to configured persons."""
@@ -449,39 +562,10 @@ class FrigateNotification(hass.Hass):
         entered_zones = event_data["entered_zones"]
         zone_str = ", ".join(entered_zones) if entered_zones else "No zones"
 
-        # Pre-build common strings
-        title = f"{label} @ {camera}"
-        message = f"{timestamp} - {zone_str} (ID: {event_id})"
-        camera_uri = f"homeassistant://navigate/dashboard-kameror/{camera}"
-        channel = f"frigate-{camera}"
-
-        self.log(f"DEBUG[{event_suffix}]: Built notification strings - Title: {title}, Channel: {channel}")
-
-        # Build base notification data
-        notification_data = {
-            "actions": [{"action": "URI", "title": "Open Camera", "uri": camera_uri}],
-            "channel": channel,
-            "importance": "high",
-            "visibility": "public",
-            "priority": "high",
-            "ttl": 0,
-            "event_id": event_id,
-            "timestamp": timestamp,
-            "notification_icon": self.cam_icons.get(camera, "mdi:cctv"),
-            "confirmation": True
-        }
-
-        # Add media to notification
-        if media_path and self.ext_domain:
-            media_url = f"{self.ext_domain}/local/frigate/{media_path}"
-            if media_type == "video":
-                notification_data["video"] = media_url
-                self.log(f"DEBUG[{event_suffix}]: Added video to notification: {media_url}")
-            elif media_type == "image":
-                notification_data["image"] = media_url
-                self.log(f"DEBUG[{event_suffix}]: Added image to notification: {media_url}")
-        else:
-            self.log(f"DEBUG[{event_suffix}]: No media attached to notification (media_path: {media_path}, ext_domain: {self.ext_domain})")
+        # Build notification data once
+        notification_data = self._build_notification_data(
+            event_id, timestamp, camera, zone_str, media_path, media_type, event_suffix
+        )
 
         self.log(f"DEBUG[{event_suffix}]: Final notification data keys: {list(notification_data.keys())}")
 
@@ -511,6 +595,9 @@ class FrigateNotification(hass.Hass):
                 self.log(f"DEBUG[{event_suffix}]: Skipping {person_config['name']} - cooldown active ({last_msg_time:.1f}s < {person_config['cooldown']}s)")
                 continue
 
+            title = f"{label} @ {camera}"
+            message = f"{timestamp} - {zone_str} (ID: {event_id})"
+
             self.log(f"DEBUG[{event_suffix}]: Sending notification to {person_config['name']} via {person_config['notify']}")
             self.call_service(f"notify/{person_config['notify']}", title=title, message=message, data=notification_data)
             self.msg_cooldown[cooldown_key] = time.time()
@@ -528,6 +615,41 @@ class FrigateNotification(hass.Hass):
             self.notification_times.append(notification_time)
 
         self.log(f"DEBUG[{event_suffix}]: Notification process completed in {notification_time:.3f}s")
+
+    def _build_notification_data(self, event_id: str, timestamp: str, camera: str, zone_str: str, media_path: Optional[str], media_type: Optional[str], event_suffix: str) -> Dict[str, Any]:
+        """Build notification data dictionary."""
+        camera_uri = f"homeassistant://navigate/dashboard-kameror/{camera}"
+        channel = f"frigate-{camera}"
+
+        self.log(f"DEBUG[{event_suffix}]: Built notification strings - Channel: {channel}")
+
+        # Build base notification data
+        notification_data = {
+            "actions": [{"action": "URI", "title": "Open Camera", "uri": camera_uri}],
+            "channel": channel,
+            "importance": "high",
+            "visibility": "public",
+            "priority": "high",
+            "ttl": 0,
+            "event_id": event_id,
+            "timestamp": timestamp,
+            "notification_icon": self.cam_icons.get(camera, "mdi:cctv"),
+            "confirmation": True
+        }
+
+        # Add media to notification
+        if media_path and self.ext_domain:
+            media_url = f"{self.ext_domain}/local/frigate/{media_path}"
+            if media_type == "video":
+                notification_data["video"] = media_url
+                self.log(f"DEBUG[{event_suffix}]: Added video to notification: {media_url}")
+            elif media_type == "image":
+                notification_data["image"] = media_url
+                self.log(f"DEBUG[{event_suffix}]: Added image to notification: {media_url}")
+        else:
+            self.log(f"DEBUG[{event_suffix}]: No media attached to notification (media_path: {media_path}, ext_domain: {self.ext_domain})")
+
+        return notification_data
 
     def _log_daily_metrics(self) -> None:
         """Log daily notification performance metrics."""
@@ -560,8 +682,8 @@ class FrigateNotification(hass.Hass):
 
                 # Add comparison if yesterday's data exists
                 yesterday_metrics = self._load_yesterday_metrics()
+                comparison = {}
                 if yesterday_metrics:
-                    comparison = {}
                     if "min_seconds" in stats and "min_seconds" in yesterday_metrics:
                         comparison.update({
                             "min_diff": round(stats["min_seconds"] - yesterday_metrics["min_seconds"], 3),
@@ -582,12 +704,15 @@ class FrigateNotification(hass.Hass):
                 # Save and log
                 self._save_metrics(today_metrics)
 
-                # Log metrics summary
+                # Build log message efficiently
                 log_parts = ["METRICS:"]
+
                 if "total_notifications" in stats:
                     log_parts.append(f"Notifications={stats['total_notifications']}, Min={stats['min_seconds']}s, Avg={stats['avg_seconds']}s, Max={stats['max_seconds']}s")
+
                 if "total_deliveries" in stats:
                     log_parts.append(f"Deliveries={stats['total_deliveries']}, Min={stats['min_delivery_seconds']}s, Avg={stats['avg_delivery_seconds']}s, Max={stats['max_delivery_seconds']}s")
+
                 if comparison:
                     comp_parts = []
                     if "min_diff" in comparison:
@@ -596,6 +721,7 @@ class FrigateNotification(hass.Hass):
                         comp_parts.append(f"Delivery diff: Min {comparison['min_delivery_diff']:+0.3f}s, Avg {comparison['avg_delivery_diff']:+0.3f}s, Max {comparison['max_delivery_diff']:+0.3f}s")
                     if comp_parts:
                         log_parts.append(" | ".join(comp_parts))
+
                 self.log(" | ".join(log_parts))
 
                 # Clear today's data for next day
@@ -682,15 +808,38 @@ class FrigateNotification(hass.Hass):
 
                 # Limit cache size if needed
                 if len(self.file_cache) > 1000:
-                    sorted_entries = sorted(self.file_cache.items(), key=lambda x: x[1]["timestamp"])
-                    for i in range(len(self.file_cache) - 1000):
-                        del self.file_cache[sorted_entries[i][0]]
+                    # Remove oldest entries to get down to 1000
+                    entries_to_remove = len(self.file_cache) - 1000
+                    oldest_entries = sorted(self.file_cache.items(), key=lambda x: x[1]["timestamp"])[:entries_to_remove]
+                    for key, _ in oldest_entries:
+                        del self.file_cache[key]
 
             if expired_keys:
                 self.log(f"Cleaned up {len(expired_keys)} expired cache entries")
 
         except Exception as e:
             self.log(f"ERROR: Failed to cleanup cache: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
+
+    def _cleanup_old_tracked_events(self) -> None:
+        """Clean up old tracked events to prevent memory leaks."""
+        try:
+            current_time = time.time()
+            cutoff_time = current_time - 300  # Remove events older than 5 minutes
+
+            with self.event_tracking_lock:
+                events_to_remove = []
+                for event_id, event_data in self.tracked_events.items():
+                    if event_data["start_time"] < cutoff_time:
+                        events_to_remove.append(event_id)
+
+                for event_id in events_to_remove:
+                    del self.tracked_events[event_id]
+
+                if events_to_remove:
+                    self.log(f"Cleaned up {len(events_to_remove)} old tracked events")
+
+        except Exception as e:
+            self.log(f"ERROR: Failed to cleanup tracked events: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
     def terminate(self) -> None:
         """Cleanup when app is terminated."""
@@ -700,6 +849,9 @@ class FrigateNotification(hass.Hass):
 
         if self.processing_thread and self.processing_thread.is_alive():
             self.processing_thread.join(timeout=5)
+
+        if hasattr(self, 'event_tracking_thread') and self.event_tracking_thread.is_alive():
+            self.event_tracking_thread.join(timeout=5)
 
         if hasattr(self, 'executor'):
             self.executor.shutdown(wait=True)
