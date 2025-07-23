@@ -29,10 +29,12 @@ Configuration:
 
 import appdaemon.plugins.hass.hassapi as hass
 import hashlib
+import heapq
 import json
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -186,7 +188,14 @@ class FrigateNotification(hass.Hass):
 
                         age = current_time - event_data["start_time"]
                         if age >= 35 and (current_time - event_data["last_check"]) >= 5:
-                            events_to_check.append((event_id, event_data))
+                            # Make a copy of event data to avoid race conditions
+                            event_copy = {
+                                "start_time": event_data["start_time"],
+                                "camera": event_data["camera"],
+                                "label": event_data["label"],
+                                "entered_zones": event_data["entered_zones"].copy() if event_data["entered_zones"] else []
+                            }
+                            events_to_check.append((event_id, event_copy))
                             event_data["last_check"] = current_time
 
                 # Log tracking status periodically
@@ -518,8 +527,20 @@ class FrigateNotification(hass.Hass):
         try:
             with urllib.request.urlopen(req, timeout=self.connection_timeout) as response:
                 self.log(f"DEBUG[{event_suffix}]: {endpoint} HTTP response received (status: {response.status})")
+
+                # Check for HTTP error status codes
+                if response.status >= 400:
+                    self.log(f"ERROR[{event_suffix}]: {endpoint} HTTP error {response.status} - treating as failed download")
+                    raise Exception(f"HTTP Error {response.status}")
+
                 content = response.read()
                 file_size = len(content)
+
+                # Check for empty or too small files based on file type
+                min_size = 1000000 if endpoint == "clip.mp4" else 50000  # 1MB for video, 50KB for images
+                if file_size < min_size:
+                    self.log(f"ERROR[{event_suffix}]: {endpoint} file too small ({file_size} bytes) - treating as failed download (minimum: {min_size} bytes)")
+                    raise ValueError(f"File too small: {file_size} bytes (minimum: {min_size} bytes)")
 
                 with open(target_path, 'wb') as f:
                     f.write(content)
@@ -808,9 +829,9 @@ class FrigateNotification(hass.Hass):
 
                 # Limit cache size if needed
                 if len(self.file_cache) > 1000:
-                    # Remove oldest entries to get down to 1000
+                    # Use heap to efficiently find oldest entries
                     entries_to_remove = len(self.file_cache) - 1000
-                    oldest_entries = sorted(self.file_cache.items(), key=lambda x: x[1]["timestamp"])[:entries_to_remove]
+                    oldest_entries = heapq.nsmallest(entries_to_remove, self.file_cache.items(), key=lambda x: x[1]["timestamp"])
                     for key, _ in oldest_entries:
                         del self.file_cache[key]
 
