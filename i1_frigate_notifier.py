@@ -284,12 +284,17 @@ class FrigateNotification(hass.Hass):
     def _download_and_notify(self, event_data: Dict[str, Any]) -> None:
         """Download media and send notifications."""
         try:
-            # Try video first, then snapshot, then no media
-            for endpoint, extension, media_type in [("clip.mp4", ".mp4", "video"), ("snapshot.jpg", ".jpg", "image")]:
-                media_path = self._download_media_with_retry(event_data["event_id"], event_data["camera"], endpoint, extension)
-                if media_path:
-                    self._send_notifications(event_data, media_path, media_type)
-                    return
+            # Try video first with 30s timeout and 3s retries
+            media_path = self._download_media_with_retry(event_data["event_id"], event_data["camera"], "clip.mp4", ".mp4", 30, 3)
+            if media_path:
+                self._send_notifications(event_data, media_path, "video")
+                return
+
+            # If video fails, try snapshot with 15s timeout and 2s retries
+            media_path = self._download_media_with_retry(event_data["event_id"], event_data["camera"], "snapshot.jpg", ".jpg", 15, 2)
+            if media_path:
+                self._send_notifications(event_data, media_path, "image")
+                return
 
             # Send notification without media if both downloads failed
             self._send_notifications(event_data, None, None)
@@ -297,19 +302,19 @@ class FrigateNotification(hass.Hass):
         except Exception as e:
             self.log(f"ERROR: Failed to download and notify for event {event_data['event_id']}: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
-    def _download_media_with_retry(self, event_id: str, camera: str, endpoint: str, extension: str) -> Optional[str]:
-        """Download media with 30s timeout and 2s retries."""
+    def _download_media_with_retry(self, event_id: str, camera: str, endpoint: str, extension: str, timeout: int, retry_interval: int) -> Optional[str]:
+        """Download media with configurable timeout and retry interval."""
         start_time = time.time()
-        while time.time() - start_time < 30:
+        while time.time() - start_time < timeout:
             try:
                 media_path = self._download_media(event_id, camera, endpoint, extension)
                 if media_path:
                     return media_path
             except Exception as e:
-                self.log(f"ERROR: Media download attempt failed for event {event_id}: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
-            time.sleep(2)
+                self.log(f"ERROR: Media download attempt failed for event {event_id} ({endpoint}): {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
+            time.sleep(retry_interval)
 
-        self.log(f"Media download timeout after 30s for event {event_id}")
+        self.log(f"Media download timeout after {timeout}s for event {event_id} ({endpoint})")
         return None
 
     def _download_media(self, event_id: str, camera: str, endpoint: str, extension: str) -> Optional[str]:
