@@ -29,12 +29,10 @@ Configuration:
 
 import appdaemon.plugins.hass.hassapi as hass
 import hashlib
-import heapq
 import json
 import sys
 import threading
 import time
-import urllib.error
 import urllib.request
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -45,6 +43,62 @@ from typing import Any, Dict, Optional
 
 class FrigateNotification(hass.Hass):
     """AppDaemon app for sending Frigate motion notifications."""
+
+    def _get_event_suffix(self, event_id: str) -> str:
+        """Get event suffix from event ID."""
+        return event_id.split('-')[-1] if '-' in event_id else event_id
+
+    def _create_cache_entry(self, cache_key: str, file_path: Path, file_size: int) -> Dict[str, Any]:
+        """Create a cache entry for a file."""
+        return {
+            "file_path": str(file_path),
+            "timestamp": datetime.now(),
+            "size": file_size,
+            "checksum": hashlib.md5(f"{cache_key}_{file_size}".encode()).hexdigest()
+        }
+
+    def _extract_metrics_from_entry(self, entry: Dict[str, Any], metric_type: str) -> Dict[str, Any]:
+        """Extract metrics from entry in either old or new format."""
+        result = {}
+        key = f"{metric_type}_times"
+
+        if key in entry:
+            if isinstance(entry[key], dict):
+                # New format with raw data and stats
+                result.update({
+                    f"total_{metric_type}": entry[key].get(f"total_{metric_type}", 0),
+                    f"min_{metric_type}_seconds": entry[key].get(f"min_{metric_type}_seconds", 0),
+                    f"avg_{metric_type}_seconds": entry[key].get(f"avg_{metric_type}_seconds", 0),
+                    f"max_{metric_type}_seconds": entry[key].get(f"max_{metric_type}_seconds", 0),
+                    f"std_{metric_type}_seconds": entry[key].get(f"std_{metric_type}_seconds", 0)
+                })
+            else:
+                # Old format - calculate stats
+                times = entry[key]
+                if times:
+                    result.update({
+                        f"total_{metric_type}": len(times),
+                        f"min_{metric_type}_seconds": round(min(times), 3),
+                        f"avg_{metric_type}_seconds": round(sum(times) / len(times), 3),
+                        f"max_{metric_type}_seconds": round(max(times), 3),
+                        f"std_{metric_type}_seconds": round(self._calculate_std(times), 3)
+                    })
+
+        return result
+
+    def _create_enriched_metrics(self, times: list, metric_type: str) -> Dict[str, Any]:
+        """Create enriched metrics structure with raw data and calculated statistics."""
+        if not times:
+            return {}
+
+        return {
+            "raw": times,
+            f"total_{metric_type}": len(times),
+            f"min_{metric_type}_seconds": round(min(times), 3),
+            f"avg_{metric_type}_seconds": round(sum(times) / len(times), 3),
+            f"max_{metric_type}_seconds": round(max(times), 3),
+            f"std_{metric_type}_seconds": round(self._calculate_std(times), 3)
+        }
 
     def initialize(self) -> None:
         """Initialize the app and set up MQTT listener."""
@@ -216,7 +270,7 @@ class FrigateNotification(hass.Hass):
 
     def _check_event_clip_availability(self, event_id: str, event_data: Dict[str, Any]) -> None:
         """Check if a clip.mp4 is available for an event and trigger notification if so."""
-        event_suffix = event_id.split('-')[-1] if '-' in event_id else event_id
+        event_suffix = self._get_event_suffix(event_id)
         age = time.time() - event_data["start_time"]
 
         self.log(f"DEBUG[{event_suffix}]: Checking clip availability for event (age: {age:.1f}s)")
@@ -275,7 +329,7 @@ class FrigateNotification(hass.Hass):
                 return
 
             event_id = event_data["event_id"]
-            event_suffix = event_id.split('-')[-1] if '-' in event_id else event_id
+            event_suffix = self._get_event_suffix(event_id)
             event_type = event_data["event_type"]
 
             self.log(f"DEBUG[{event_suffix}]: MQTT event received - Topic: {topic}, Event ID: {event_id}, Type: {event_type}")
@@ -365,15 +419,7 @@ class FrigateNotification(hass.Hass):
         except Exception as e:
             self.log(f"ERROR: Failed to process notification received event: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
-    def _create_cache_entry(self, cache_key: str, file_path: Path) -> Dict[str, Any]:
-        """Create a cache entry for a file."""
-        file_size = file_path.stat().st_size
-        return {
-            "file_path": str(file_path),
-            "timestamp": datetime.now(),
-            "size": file_size,
-            "checksum": hashlib.md5(f"{cache_key}_{file_size}".encode()).hexdigest()
-        }
+
 
     def _extract_event_data(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Extract and validate event data from payload."""
@@ -403,7 +449,7 @@ class FrigateNotification(hass.Hass):
     def _process_event(self, event_data: Dict[str, Any]) -> None:
         """Process a Frigate event."""
         event_id = event_data["event_id"]
-        event_suffix = event_id.split('-')[-1] if '-' in event_id else event_id
+        event_suffix = self._get_event_suffix(event_id)
 
         try:
             self.log(f"DEBUG[{event_suffix}]: Processing event - ID: {event_id}, Type: {event_data['event_type']}, Camera: {event_data['camera']}, Label: {event_data['label']}")
@@ -426,7 +472,7 @@ class FrigateNotification(hass.Hass):
     def _download_and_notify(self, event_data: Dict[str, Any]) -> None:
         """Download media and send notifications."""
         event_id = event_data["event_id"]
-        event_suffix = event_id.split('-')[-1] if '-' in event_id else event_id
+        event_suffix = self._get_event_suffix(event_id)
 
         try:
             self.log(f"DEBUG[{event_suffix}]: Starting media download and notification process")
@@ -518,7 +564,9 @@ class FrigateNotification(hass.Hass):
 
         if target_path.exists():
             self.log(f"DEBUG[{event_suffix}]: {endpoint} file already exists, adding to cache")
-            self._add_to_cache(cache_key, target_path)
+            with self.cache_lock:
+                file_size = target_path.stat().st_size
+                self.file_cache[cache_key] = self._create_cache_entry(cache_key, target_path, file_size)
             relative_path = f"{camera}/{date_dir}/{filename}"
             self.log(f"DEBUG[{event_suffix}]: Returning existing {endpoint} file: {relative_path}")
             return relative_path
@@ -552,7 +600,8 @@ class FrigateNotification(hass.Hass):
 
                 self.log(f"DEBUG[{event_suffix}]: {endpoint} downloaded successfully ({file_size} bytes)")
 
-            self._add_to_cache(cache_key, target_path)
+            with self.cache_lock:
+                self.file_cache[cache_key] = self._create_cache_entry(cache_key, target_path, file_size)
 
             relative_path = f"{camera}/{date_dir}/{filename}"
             self.log(f"DEBUG[{event_suffix}]: {endpoint} download complete, returning: {relative_path}")
@@ -566,10 +615,7 @@ class FrigateNotification(hass.Hass):
                 self.log(f"DEBUG[{event_suffix}]: Removed partial {endpoint} file")
             raise
 
-    def _add_to_cache(self, cache_key: str, file_path: Path) -> None:
-        """Add file to cache with proper locking."""
-        with self.cache_lock:
-            self.file_cache[cache_key] = self._create_cache_entry(cache_key, file_path)
+
 
     def _send_notifications(self, event_data: Dict[str, Any], media_path: Optional[str], media_type: Optional[str], event_suffix: str) -> None:
         """Send notifications to configured persons."""
@@ -589,9 +635,35 @@ class FrigateNotification(hass.Hass):
         zone_str = ", ".join(entered_zones) if entered_zones else "No zones"
 
         # Build notification data once
-        notification_data = self._build_notification_data(
-            event_id, timestamp, camera, zone_str, media_path, media_type, event_suffix
-        )
+        camera_uri = f"homeassistant://navigate/dashboard-kameror/{camera}"
+        channel = f"frigate-{camera}"
+
+        self.log(f"DEBUG[{event_suffix}]: Built notification strings - Channel: {channel}")
+
+        notification_data = {
+            "actions": [{"action": "URI", "title": "Open Camera", "uri": camera_uri}],
+            "channel": channel,
+            "importance": "high",
+            "visibility": "public",
+            "priority": "high",
+            "ttl": 0,
+            "event_id": event_id,
+            "timestamp": timestamp,
+            "notification_icon": self.cam_icons.get(camera, "mdi:cctv"),
+            "confirmation": True
+        }
+
+        # Add media to notification
+        if media_path and self.ext_domain:
+            media_url = f"{self.ext_domain}/local/frigate/{media_path}"
+            if media_type == "video":
+                notification_data["video"] = media_url
+                self.log(f"DEBUG[{event_suffix}]: Added video to notification: {media_url}")
+            elif media_type == "image":
+                notification_data["image"] = media_url
+                self.log(f"DEBUG[{event_suffix}]: Added image to notification: {media_url}")
+        else:
+            self.log(f"DEBUG[{event_suffix}]: No media attached to notification (media_path: {media_path}, ext_domain: {self.ext_domain})")
 
         self.log(f"DEBUG[{event_suffix}]: Final notification data keys: {list(notification_data.keys())}")
 
@@ -644,44 +716,14 @@ class FrigateNotification(hass.Hass):
 
         self.log(f"DEBUG[{event_suffix}]: Notification process completed in {notification_time:.3f}s")
 
-    def _build_notification_data(self, event_id: str, timestamp: str, camera: str, zone_str: str, media_path: Optional[str], media_type: Optional[str], event_suffix: str) -> Dict[str, Any]:
-        """Build notification data dictionary."""
-        camera_uri = f"homeassistant://navigate/dashboard-kameror/{camera}"
-        channel = f"frigate-{camera}"
 
-        self.log(f"DEBUG[{event_suffix}]: Built notification strings - Channel: {channel}")
-
-        # Build base notification data
-        notification_data = {
-            "actions": [{"action": "URI", "title": "Open Camera", "uri": camera_uri}],
-            "channel": channel,
-            "importance": "high",
-            "visibility": "public",
-            "priority": "high",
-            "ttl": 0,
-            "event_id": event_id,
-            "timestamp": timestamp,
-            "notification_icon": self.cam_icons.get(camera, "mdi:cctv"),
-            "confirmation": True
-        }
-
-        # Add media to notification
-        if media_path and self.ext_domain:
-            media_url = f"{self.ext_domain}/local/frigate/{media_path}"
-            if media_type == "video":
-                notification_data["video"] = media_url
-                self.log(f"DEBUG[{event_suffix}]: Added video to notification: {media_url}")
-            elif media_type == "image":
-                notification_data["image"] = media_url
-                self.log(f"DEBUG[{event_suffix}]: Added image to notification: {media_url}")
-        else:
-            self.log(f"DEBUG[{event_suffix}]: No media attached to notification (media_path: {media_path}, ext_domain: {self.ext_domain})")
-
-        return notification_data
 
     def _log_daily_metrics(self, **kwargs) -> None:
-        """Log daily notification performance metrics."""
+        """Log daily notification performance metrics and enrich previous day's data."""
         try:
+            # First, enrich yesterday's data with calculated statistics
+            self._enrich_yesterdays_metrics()
+
             with self.metrics_lock:
                 if not self.notification_times and not self.delivery_times:
                     self.log("METRICS: No notifications sent today")
@@ -824,6 +866,50 @@ class FrigateNotification(hass.Hass):
         except Exception as e:
             self.log(f"ERROR: Failed to save today's metrics: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
+    def _enrich_yesterdays_metrics(self) -> None:
+        """Enrich yesterday's metrics with calculated statistics (min, avg, max, std)."""
+        try:
+            if not self.metrics_file.exists():
+                return
+
+            with open(self.metrics_file, 'r') as f:
+                data = json.load(f)
+
+            yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+            # Find yesterday's entry
+            for entry in data.get("daily_metrics", []):
+                if entry.get("date") == yesterday:
+                    # Calculate statistics for notification_times
+                    if "notification_times" in entry and entry["notification_times"]:
+                        times = entry["notification_times"]
+                        entry["notification_times"] = self._create_enriched_metrics(times, "notification")
+                        self.log(f"Enriched yesterday's notification metrics: {len(times)} notifications, min={entry['notification_times']['min_notification_seconds']}s, avg={entry['notification_times']['avg_notification_seconds']}s, max={entry['notification_times']['max_notification_seconds']}s, std={entry['notification_times']['std_notification_seconds']}s")
+
+                    # Calculate statistics for delivery_times
+                    if "delivery_times" in entry and entry["delivery_times"]:
+                        times = entry["delivery_times"]
+                        entry["delivery_times"] = self._create_enriched_metrics(times, "delivery")
+                        self.log(f"Enriched yesterday's delivery metrics: {len(times)} deliveries, min={entry['delivery_times']['min_delivery_seconds']}s, avg={entry['delivery_times']['avg_delivery_seconds']}s, max={entry['delivery_times']['max_delivery_seconds']}s, std={entry['delivery_times']['std_delivery_seconds']}s")
+
+                    # Save the enriched data back to file
+                    with open(self.metrics_file, 'w') as f:
+                        json.dump(data, f, indent=2)
+
+                    return
+
+        except Exception as e:
+            self.log(f"ERROR: Failed to enrich yesterday's metrics: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
+
+    def _calculate_std(self, values: list) -> float:
+        """Calculate standard deviation of a list of values."""
+        if len(values) < 2:
+            return 0.0
+
+        mean = sum(values) / len(values)
+        variance = sum((x - mean) ** 2 for x in values) / len(values)
+        return variance ** 0.5
+
     def _load_yesterday_metrics(self) -> Optional[Dict[str, Any]]:
         """Load yesterday's metrics from file."""
         try:
@@ -836,7 +922,10 @@ class FrigateNotification(hass.Hass):
             yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
             for entry in data.get("daily_metrics", []):
                 if entry.get("date") == yesterday:
-                    return entry
+                    result = {"date": entry["date"]}
+                    result.update(self._extract_metrics_from_entry(entry, "notification"))
+                    result.update(self._extract_metrics_from_entry(entry, "delivery"))
+                    return result
 
             return None
 
@@ -879,10 +968,10 @@ class FrigateNotification(hass.Hass):
 
                 # Limit cache size if needed
                 if len(self.file_cache) > 1000:
-                    # Use heap to efficiently find oldest entries
+                    # Sort by timestamp and remove oldest entries
                     entries_to_remove = len(self.file_cache) - 1000
-                    oldest_entries = heapq.nsmallest(entries_to_remove, self.file_cache.items(), key=lambda x: x[1]["timestamp"])
-                    for key, _ in oldest_entries:
+                    sorted_entries = sorted(self.file_cache.items(), key=lambda x: x[1]["timestamp"])
+                    for key, _ in sorted_entries[:entries_to_remove]:
                         del self.file_cache[key]
 
             if expired_keys:

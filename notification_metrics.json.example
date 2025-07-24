@@ -7,8 +7,22 @@
     },
     {
       "date": "2025-01-21",
-      "notification_times": [0.198, 0.456, 0.987, 0.345, 0.678, 0.234, 0.567, 0.890, 0.345, 0.678, 0.234, 0.567],
-      "delivery_times": [1.8, 3.12, 7.5, 2.5, 3.8, 2.1, 3.5, 4.8, 1.7, 2.9]
+      "notification_times": {
+        "raw": [0.198, 0.456, 0.987, 0.345, 0.678, 0.234, 0.567, 0.890, 0.345, 0.678, 0.234, 0.567],
+        "total_notifications": 12,
+        "min_seconds": 0.198,
+        "avg_seconds": 0.456,
+        "max_seconds": 0.987,
+        "std_seconds": 0.234
+      },
+      "delivery_times": {
+        "raw": [1.8, 3.12, 7.5, 2.5, 3.8, 2.1, 3.5, 4.8, 1.7, 2.9],
+        "total_deliveries": 10,
+        "min_delivery_seconds": 1.7,
+        "avg_delivery_seconds": 3.12,
+        "max_delivery_seconds": 7.5,
+        "std_delivery_seconds": 1.6
+      }
     }
   ]
 }
