@@ -275,6 +275,24 @@ class FrigateNotification(hass.Hass):
 
         self.log(f"DEBUG[{event_suffix}]: Checking clip availability for event (age: {age:.1f}s)")
 
+        # Check for potential recipients before attempting media download
+        event_data_for_check = {
+            "event_id": event_id,
+            "camera": event_data["camera"],
+            "label": event_data["label"],
+            "entered_zones": event_data["entered_zones"],
+            "event_type": "end",
+            "timestamp": datetime.fromtimestamp(event_data["start_time"])
+        }
+
+        if not self._check_potential_recipients(event_data_for_check, event_suffix):
+            self.log(f"DEBUG[{event_suffix}]: No potential recipients found, marking event as handled and skipping clip check")
+            # Mark as handled immediately to avoid further processing
+            with self.event_tracking_lock:
+                if event_id in self.tracked_events:
+                    self.tracked_events[event_id]["handled"] = True
+            return
+
         try:
             # Try to download the clip with a single attempt
             media_path = self._download_media(event_id, event_data["camera"], "clip.mp4", ".mp4", event_suffix)
@@ -284,7 +302,8 @@ class FrigateNotification(hass.Hass):
 
                 # Mark as handled
                 with self.event_tracking_lock:
-                    event_data["handled"] = True
+                    if event_id in self.tracked_events:
+                        self.tracked_events[event_id]["handled"] = True
 
                 # Create event data and send notification
                 event_data_for_notification = {
@@ -360,9 +379,19 @@ class FrigateNotification(hass.Hass):
                     self.log(f"DEBUG[{event_suffix}]: Event already handled, skipping")
                     return
 
-            # For end events, process immediately
+            # For end events, check for potential recipients immediately
             if event_type == "end":
-                self.log(f"DEBUG[{event_suffix}]: End event received, processing immediately")
+                self.log(f"DEBUG[{event_suffix}]: End event received, checking for potential recipients")
+
+                # Check if there are any potential recipients before processing
+                if not self._check_potential_recipients(event_data, event_suffix):
+                    self.log(f"DEBUG[{event_suffix}]: No potential recipients found, marking event as handled and skipping")
+                    # Mark as handled immediately to avoid further processing
+                    with self.event_tracking_lock:
+                        self.tracked_events[event_id]["handled"] = True
+                    return
+
+                self.log(f"DEBUG[{event_suffix}]: Potential recipients found, proceeding with media download")
                 # Mark as handled
                 with self.event_tracking_lock:
                     self.tracked_events[event_id]["handled"] = True
@@ -499,6 +528,46 @@ class FrigateNotification(hass.Hass):
 
         except Exception as e:
             self.log(f"ERROR: Failed to download and notify for event {event_id}: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
+
+    def _check_potential_recipients(self, event_data: Dict[str, Any], event_suffix: str) -> bool:
+        """Check if there are any potential recipients for this event based on zones and labels."""
+        if not self.person_configs:
+            self.log(f"DEBUG[{event_suffix}]: No person configs found, no potential recipients")
+            return False
+
+        camera = event_data["camera"]
+        label = event_data["label"]
+        entered_zones = event_data["entered_zones"]
+
+        self.log(f"DEBUG[{event_suffix}]: Checking potential recipients - Camera: {camera}, Label: {label}, Zones: {entered_zones}")
+
+        potential_recipients = 0
+        for person_config in self.person_configs:
+            if not person_config["enabled"]:
+                continue
+
+            if person_config["cameras"] and camera not in person_config["cameras"]:
+                continue
+
+            if person_config["zones"] and not any(zone in person_config["zones"] for zone in entered_zones):
+                continue
+
+            if label not in person_config["labels"]:
+                continue
+
+            # Check cooldown
+            cooldown_key = f"{person_config['notify']}/{camera}"
+            last_msg_time = time.time() - self.msg_cooldown.get(cooldown_key, 0)
+
+            if last_msg_time < person_config["cooldown"]:
+                self.log(f"DEBUG[{event_suffix}]: {person_config['name']} in cooldown ({last_msg_time:.1f}s < {person_config['cooldown']}s)")
+                continue
+
+            potential_recipients += 1
+            self.log(f"DEBUG[{event_suffix}]: Found potential recipient: {person_config['name']}")
+
+        self.log(f"DEBUG[{event_suffix}]: Found {potential_recipients} potential recipients")
+        return potential_recipients > 0
 
     def _download_media_with_retry(self, event_id: str, camera: str, endpoint: str, extension: str, timeout: int, retry_interval: int, event_suffix: str) -> Optional[str]:
         """Download media with configurable timeout and retry interval."""
