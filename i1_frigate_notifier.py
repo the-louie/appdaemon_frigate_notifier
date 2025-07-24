@@ -64,6 +64,9 @@ class FrigateNotification(hass.Hass):
         self.metrics_lock = threading.Lock()
         self.metrics_file = Path(__file__).parent / "notification_metrics.json"
 
+        # Load today's metrics on startup
+        self._load_todays_metrics()
+
         # Event tracking for early notification
         self.tracked_events = {}  # event_id -> {start_time, last_check, handled}
         self.event_tracking_lock = threading.Lock()
@@ -351,6 +354,8 @@ class FrigateNotification(hass.Hass):
                 if 0 <= delivery_time <= 3600:
                     with self.metrics_lock:
                         self.delivery_times.append(delivery_time)
+                        # Save metrics immediately after each delivery time
+                        self._save_todays_metrics()
 
                     self.log(f"Notification delivered in {delivery_time:.3f}s - Event ID: {notification_data.get('event_id', 'unknown')}")
 
@@ -634,6 +639,8 @@ class FrigateNotification(hass.Hass):
         notification_time = time.time() - notification_start
         with self.metrics_lock:
             self.notification_times.append(notification_time)
+            # Save metrics immediately after each notification
+            self._save_todays_metrics()
 
         self.log(f"DEBUG[{event_suffix}]: Notification process completed in {notification_time:.3f}s")
 
@@ -722,8 +729,7 @@ class FrigateNotification(hass.Hass):
                     if comparison:
                         today_metrics["comparison"] = comparison
 
-                # Save and log
-                self._save_metrics(today_metrics)
+                # Log metrics (data is already saved continuously)
 
                 # Build log message efficiently
                 log_parts = ["METRICS:"]
@@ -745,12 +751,78 @@ class FrigateNotification(hass.Hass):
 
                 self.log(" | ".join(log_parts))
 
-                # Clear today's data for next day
+                # Clear today's data for next day and save empty state
                 self.notification_times.clear()
                 self.delivery_times.clear()
+                self._save_todays_metrics()
 
         except Exception as e:
             self.log(f"ERROR: Failed to log daily metrics: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
+
+    def _load_todays_metrics(self) -> None:
+        """Load today's metrics from file on startup."""
+        try:
+            if not self.metrics_file.exists():
+                self.log("DEBUG: No metrics file found, starting fresh")
+                return
+
+            with open(self.metrics_file, 'r') as f:
+                data = json.load(f)
+
+            today = datetime.now().strftime("%Y-%m-%d")
+            for entry in data.get("daily_metrics", []):
+                if entry.get("date") == today:
+                    # Load today's data back into memory
+                    if "notification_times" in entry:
+                        self.notification_times = entry["notification_times"]
+                    if "delivery_times" in entry:
+                        self.delivery_times = entry["delivery_times"]
+
+                    self.log(f"DEBUG: Loaded {len(self.notification_times)} notification times and {len(self.delivery_times)} delivery times from today's metrics")
+                    return
+
+            self.log("DEBUG: No today's metrics found in file, starting fresh")
+
+        except Exception as e:
+            self.log(f"ERROR: Failed to load today's metrics: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
+
+    def _save_todays_metrics(self) -> None:
+        """Save today's current metrics to file."""
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+
+            # Load existing data
+            if self.metrics_file.exists():
+                with open(self.metrics_file, 'r') as f:
+                    data = json.load(f)
+            else:
+                data = {"daily_metrics": []}
+
+            # Find today's entry or create new one
+            today_entry = None
+            for entry in data["daily_metrics"]:
+                if entry.get("date") == today:
+                    today_entry = entry
+                    break
+
+            if not today_entry:
+                today_entry = {"date": today}
+                data["daily_metrics"].append(today_entry)
+
+            # Update today's entry with current data
+            today_entry["notification_times"] = self.notification_times.copy()
+            today_entry["delivery_times"] = self.delivery_times.copy()
+
+            # Keep only last 30 days
+            if len(data["daily_metrics"]) > 30:
+                data["daily_metrics"] = data["daily_metrics"][-30:]
+
+            # Save to file
+            with open(self.metrics_file, 'w') as f:
+                json.dump(data, f, indent=2)
+
+        except Exception as e:
+            self.log(f"ERROR: Failed to save today's metrics: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
     def _load_yesterday_metrics(self) -> Optional[Dict[str, Any]]:
         """Load yesterday's metrics from file."""
@@ -772,29 +844,7 @@ class FrigateNotification(hass.Hass):
             self.log(f"ERROR: Failed to load yesterday's metrics: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
             return None
 
-    def _save_metrics(self, today_metrics: Dict[str, Any]) -> None:
-        """Save metrics to JSON file."""
-        try:
-            # Load existing data
-            if self.metrics_file.exists():
-                with open(self.metrics_file, 'r') as f:
-                    data = json.load(f)
-            else:
-                data = {"daily_metrics": []}
 
-            # Add today's metrics
-            data["daily_metrics"].append(today_metrics)
-
-            # Keep only last 30 days
-            if len(data["daily_metrics"]) > 30:
-                data["daily_metrics"] = data["daily_metrics"][-30:]
-
-            # Save to file
-            with open(self.metrics_file, 'w') as f:
-                json.dump(data, f, indent=2)
-
-        except Exception as e:
-            self.log(f"ERROR: Failed to save metrics: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
     def _cleanup_old_files(self, **kwargs) -> None:
         """Clean up old video files to prevent disk space issues."""
