@@ -672,7 +672,7 @@ class FrigateNotification(hass.Hass):
 
         return notification_data
 
-    def _log_daily_metrics(self) -> None:
+    def _log_daily_metrics(self, **kwargs) -> None:
         """Log daily notification performance metrics."""
         try:
             with self.metrics_lock:
@@ -796,7 +796,7 @@ class FrigateNotification(hass.Hass):
         except Exception as e:
             self.log(f"ERROR: Failed to save metrics: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
-    def _cleanup_old_files(self) -> None:
+    def _cleanup_old_files(self, **kwargs) -> None:
         """Clean up old video files to prevent disk space issues."""
         if not self.snapshot_dir or not self.snapshot_dir.exists():
             return
@@ -816,7 +816,7 @@ class FrigateNotification(hass.Hass):
         except Exception as e:
             self.log(f"ERROR: Failed to cleanup old files: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
-    def _cleanup_cache(self) -> None:
+    def _cleanup_cache(self, **kwargs) -> None:
         """Clean up expired cache entries and limit cache size."""
         try:
             cutoff_time = datetime.now() - timedelta(hours=self.cache_ttl_hours)
@@ -841,7 +841,7 @@ class FrigateNotification(hass.Hass):
         except Exception as e:
             self.log(f"ERROR: Failed to cleanup cache: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
-    def _cleanup_old_tracked_events(self) -> None:
+    def _cleanup_old_tracked_events(self, **kwargs) -> None:
         """Clean up old tracked events to prevent memory leaks."""
         try:
             current_time = time.time()
