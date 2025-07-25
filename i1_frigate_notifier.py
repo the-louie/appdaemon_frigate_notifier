@@ -65,28 +65,43 @@ class FrigateNotification(hass.Hass):
                 # Old format - calculate stats
                 times = entry[key]
                 if times:
+                    stats = self._calculate_stats(times)
                     result.update({
                         f"total_{metric_type}": len(times),
-                        f"min_{metric_type}_seconds": round(min(times), 3),
-                        f"avg_{metric_type}_seconds": round(sum(times) / len(times), 3),
-                        f"max_{metric_type}_seconds": round(max(times), 3),
-                        f"std_{metric_type}_seconds": round((sum((x - sum(times) / len(times)) ** 2 for x in times) / len(times)) ** 0.5 if len(times) >= 2 else 0.0, 3)
+                        f"min_{metric_type}_seconds": stats["min"],
+                        f"avg_{metric_type}_seconds": stats["avg"],
+                        f"max_{metric_type}_seconds": stats["max"],
+                        f"std_{metric_type}_seconds": stats["std"]
                     })
 
         return result
+
+    def _calculate_stats(self, times: list) -> Dict[str, float]:
+        """Calculate basic statistics for a list of times."""
+        if not times:
+            return {}
+
+        mean = sum(times) / len(times)
+        return {
+            "min": round(min(times), 3),
+            "avg": round(mean, 3),
+            "max": round(max(times), 3),
+            "std": round((sum((x - mean) ** 2 for x in times) / len(times)) ** 0.5 if len(times) >= 2 else 0.0, 3)
+        }
 
     def _create_enriched_metrics(self, times: list, metric_type: str) -> Dict[str, Any]:
         """Create enriched metrics structure with raw data and calculated statistics."""
         if not times:
             return {}
 
+        stats = self._calculate_stats(times)
         return {
             "raw": times,
             f"total_{metric_type}": len(times),
-            f"min_{metric_type}_seconds": round(min(times), 3),
-            f"avg_{metric_type}_seconds": round(sum(times) / len(times), 3),
-            f"max_{metric_type}_seconds": round(max(times), 3),
-            f"std_{metric_type}_seconds": round((sum((x - sum(times) / len(times)) ** 2 for x in times) / len(times)) ** 0.5 if len(times) >= 2 else 0.0, 3)
+            f"min_{metric_type}_seconds": stats["min"],
+            f"avg_{metric_type}_seconds": stats["avg"],
+            f"max_{metric_type}_seconds": stats["max"],
+            f"std_{metric_type}_seconds": stats["std"]
         }
 
     def initialize(self) -> None:
@@ -832,19 +847,21 @@ class FrigateNotification(hass.Hass):
                 # Calculate statistics
                 stats = {}
                 if self.notification_times:
+                    notification_stats = self._calculate_stats(self.notification_times)
                     stats.update({
                         "total_notifications": len(self.notification_times),
-                        "min_seconds": round(min(self.notification_times), 3),
-                        "avg_seconds": round(sum(self.notification_times) / len(self.notification_times), 3),
-                        "max_seconds": round(max(self.notification_times), 3)
+                        "min_seconds": notification_stats["min"],
+                        "avg_seconds": notification_stats["avg"],
+                        "max_seconds": notification_stats["max"]
                     })
 
                 if self.delivery_times:
+                    delivery_stats = self._calculate_stats(self.delivery_times)
                     stats.update({
                         "total_deliveries": len(self.delivery_times),
-                        "min_delivery_seconds": round(min(self.delivery_times), 3),
-                        "avg_delivery_seconds": round(sum(self.delivery_times) / len(self.delivery_times), 3),
-                        "max_delivery_seconds": round(max(self.delivery_times), 3)
+                        "min_delivery_seconds": delivery_stats["min"],
+                        "avg_delivery_seconds": delivery_stats["avg"],
+                        "max_delivery_seconds": delivery_stats["max"]
                     })
 
                 # Prepare today's metrics
