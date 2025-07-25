@@ -122,6 +122,10 @@ class FrigateNotification(hass.Hass):
         self.metrics_lock = threading.Lock()
         self.metrics_file = Path(__file__).parent / "notification_metrics.json"
 
+        # Notification tracking to prevent duplicates
+        self.notified_events = set()  # Track events that have already been notified
+        self.notification_lock = threading.Lock()
+
         # Load today's metrics on startup
         self._load_todays_metrics()
 
@@ -277,6 +281,14 @@ class FrigateNotification(hass.Hass):
         event_suffix = event_id.split('-')[-1] if '-' in event_id else event_id
         age = time.time() - event_data["start_time"]
 
+        # Prevent events from running indefinitely (max 10 minutes)
+        if age > 600:  # 10 minutes
+            self.log(f"DEBUG[{event_suffix}]: Event too old ({age:.1f}s), marking as handled to prevent infinite processing")
+            with self.event_tracking_lock:
+                if event_id in self.tracked_events:
+                    self.tracked_events[event_id]["handled"] = True
+            return
+
         self.log(f"DEBUG[{event_suffix}]: Checking clip availability for event (age: {age:.1f}s)")
 
         # Check for potential recipients before attempting media download
@@ -371,8 +383,19 @@ class FrigateNotification(hass.Hass):
                         "entered_zones": event_data["entered_zones"]
                     }
                     self.log(f"DEBUG[{event_suffix}]: Started tracking event (type: {event_type})")
+                elif event_type == "new":
+                    # Only reset tracking for actual new events, not updates
+                    self.tracked_events[event_id].update({
+                        "start_time": time.time(),
+                        "last_check": 0,
+                        "handled": False,
+                        "camera": event_data["camera"],
+                        "label": event_data["label"],
+                        "entered_zones": event_data["entered_zones"]
+                    })
+                    self.log(f"DEBUG[{event_suffix}]: Reset tracking for new event (type: {event_type})")
                 else:
-                    # Update existing event data
+                    # Update existing event data without resetting tracking
                     self.tracked_events[event_id].update({
                         "camera": event_data["camera"],
                         "label": event_data["label"],
@@ -743,10 +766,18 @@ class FrigateNotification(hass.Hass):
             self.log(f"DEBUG[{event_suffix}]: No person configs found, skipping notifications")
             return
 
+        event_id = event_data["event_id"]
+
+        # Check if this event has already been notified to prevent duplicates
+        with self.notification_lock:
+            if event_id in self.notified_events:
+                self.log(f"DEBUG[{event_suffix}]: Event already notified, skipping duplicate notification")
+                return
+            self.notified_events.add(event_id)
+
         notification_start = time.time()
         timestamp = event_data["timestamp"].strftime("%H:%M:%S")
         camera = event_data["camera"]
-        event_id = event_data["event_id"]
         label = event_data["label"]
         entered_zones = event_data["entered_zones"]
         zone_str = ", ".join(entered_zones) if entered_zones else "No zones"
@@ -1099,7 +1130,11 @@ class FrigateNotification(hass.Hass):
             with self.event_tracking_lock:
                 events_to_remove = []
                 for event_id, event_data in self.tracked_events.items():
+                    # Remove events that are too old or have been handled for too long
                     if event_data["start_time"] < cutoff_time:
+                        events_to_remove.append(event_id)
+                    elif event_data["handled"] and (current_time - event_data.get("last_check", 0)) > 60:
+                        # Remove handled events that haven't been checked recently
                         events_to_remove.append(event_id)
 
                 for event_id in events_to_remove:
@@ -1107,6 +1142,12 @@ class FrigateNotification(hass.Hass):
 
                 if events_to_remove:
                     self.log(f"Cleaned up {len(events_to_remove)} old tracked events")
+
+                # Also clean up notified events set to prevent memory leaks
+                if len(self.notified_events) > 1000:
+                    # Keep only the most recent 500 events
+                    self.notified_events.clear()
+                    self.log("Cleaned up notified events set to prevent memory leaks")
 
         except Exception as e:
             self.log(f"ERROR: Failed to cleanup tracked events: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
