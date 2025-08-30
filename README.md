@@ -303,4 +303,6 @@ The app provides detailed logging at different levels:
 
 ## License
 
-This project is open source and available under the BSD 2-Clause License. See the [LICENSE](LICENSE) file for details.
+This project is open source and available under the BSD 2-Clause License.
+
+Copyright (c) 2025 the_louie. See the [LICENSE](LICENSE) file for details.

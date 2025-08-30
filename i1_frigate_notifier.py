@@ -5,9 +5,10 @@ Copyright (c) 2025 the_louie
 All rights reserved.
 
 This app listens to Frigate MQTT events and sends notifications to configured users
-when motion is detected. It supports zone filtering, cooldown periods, and snapshot
-image downloads. Notifications include image attachments and action links to view
-the corresponding video clips.
+when motion is detected. It supports zone filtering, cooldown periods, snapshot
+image downloads, and face detection. Notifications include image attachments and
+action links to view the corresponding video clips. When face detection is enabled
+and a known person is recognized, their name will be included in the notification title.
 
 Configuration:
   frigate_notify:
@@ -18,6 +19,8 @@ Configuration:
     ext_domain: "https://your-domain.com"
     snapshot_dir: "/path/to/snapshots"
     only_zones: true
+    face_detection_enabled: true
+    face_detection_threshold: 0.7
     persons:
       - name: user1
         notify: mobile_app_device
@@ -39,7 +42,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import appdaemon.plugins.hass.hassapi as hass
 
@@ -47,39 +50,14 @@ import appdaemon.plugins.hass.hassapi as hass
 class FrigateNotification(hass.Hass):
     """AppDaemon app for sending Frigate motion notifications."""
 
-    def _calculate_stats(self, times: List[float]) -> Dict[str, float]:
-        """Calculate statistical metrics for a list of times."""
-        if not times:
-            return {}
-
-        mean = sum(times) / len(times)
-        std_dev = (sum((x - mean) ** 2 for x in times) / len(times)) ** 0.5 if len(times) >= 2 else 0.0
-
-        return {
-            "min": round(min(times), 3),
-            "avg": round(mean, 3),
-            "max": round(max(times), 3),
-            "std": round(std_dev, 3)
-        }
-
-    def _create_metrics_dict(self, times: List[float], metric_type: str, include_raw: bool = False) -> Dict[str, Any]:
-        """Create metrics dictionary with optional raw data."""
-        if not times:
-            return {}
-
-        stats = self._calculate_stats(times)
-        result = {
-            f"total_{metric_type}": len(times),
-            f"min_{metric_type}_seconds": stats["min"],
-            f"avg_{metric_type}_seconds": stats["avg"],
-            f"max_{metric_type}_seconds": stats["max"],
-            f"std_{metric_type}_seconds": stats["std"]
-        }
-
-        if include_raw:
-            result["raw"] = times
-
-        return result
+    # Constants
+    MAX_QUEUE_SIZE = 1000
+    MAX_CACHE_SIZE = 1000
+    MAX_NOTIFIED_EVENTS = 1000
+    CIRCUIT_BREAKER_TIMEOUT = 60
+    CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5
+    MIN_FILE_SIZE_BYTES = 50000
+    DELIVERY_TIME_THRESHOLD = 3600
 
     def initialize(self) -> None:
         """Initialize the Frigate notification app.
@@ -89,7 +67,7 @@ class FrigateNotification(hass.Hass):
         """
         self.msg_cooldown = {}
         self.person_configs = []
-        self.event_queue = deque(maxlen=1000)
+        self.event_queue = deque(maxlen=self.MAX_QUEUE_SIZE)
         self.queue_lock = threading.Lock()
         self.processing_thread = None
         self.shutdown_event = threading.Event()
@@ -160,6 +138,11 @@ class FrigateNotification(hass.Hass):
         self.max_file_age_days = self.args.get("max_file_age_days", 30)
         self.cache_ttl_hours = self.args.get("cache_ttl_hours", 24)
         self.connection_timeout = self.args.get("connection_timeout", 30)
+
+        # Face detection settings
+        self.face_detection_enabled = self.args.get("face_detection_enabled", True)
+        threshold = self.args.get("face_detection_threshold", 0.7)
+        self.face_detection_threshold = max(0.0, min(1.0, threshold))  # Ensure 0.0-1.0 range
 
         # Setup snapshot directory
         snapshot_dir = self.args.get("snapshot_dir")
@@ -244,6 +227,8 @@ class FrigateNotification(hass.Hass):
             if not data or 'topic' not in data or 'payload' not in data or not data['topic'].startswith(self.mqtt_topic):
                 return
 
+            topic = data['topic']
+
             # Parse JSON payload
             payload = data['payload']
             if isinstance(payload, str):
@@ -253,28 +238,56 @@ class FrigateNotification(hass.Hass):
                     self.log("ERROR: Invalid JSON payload", level="ERROR")
                     return
 
-            # Extract event data and validate it's an end event
-            event_data = self._extract_event_data(payload)
-            if not event_data or event_data["event_type"] != "end":
-                return
-
-            event_id = event_data["event_id"]
-            event_suffix = event_id.split('-')[-1] if '-' in event_id else event_id
-
-            # Early exit if no potential recipients
-            if not self._has_potential_recipients(event_data):
-                return
-
-            # Queue event for processing
-            with self.queue_lock:
-                if len(self.event_queue) < 1000:
-                    self.event_queue.append(event_data)
-                else:
-                    self.log(f"Event queue full, dropping event {event_suffix}")
+            # Handle different message types based on topic
+            if topic.endswith('/events'):
+                self._handle_events_message(payload)
+            elif topic.endswith('/tracked_object_update'):
+                self._handle_tracked_object_update(payload)
 
         except Exception as e:
             line_num = sys.exc_info()[2].tb_lineno
             self.log(f"ERROR: Failed to process MQTT message: {e} (line {line_num})", level="ERROR")
+
+    def _handle_events_message(self, payload: Dict[str, Any]) -> None:
+        """Handle frigate/events messages."""
+        # Extract event data and validate it's an end event
+        event_data = self._extract_event_data(payload)
+        if not event_data or event_data["event_type"] != "end":
+            return
+
+        # Skip false positives as per Frigate documentation
+        if event_data.get("false_positive", False):
+            return
+
+        event_id = event_data["event_id"]
+        event_suffix = event_id.split('-')[-1] if '-' in event_id else event_id
+
+        # Early exit if no potential recipients
+        if not self._has_potential_recipients(event_data):
+            return
+
+        # Queue event for processing
+        with self.queue_lock:
+            if len(self.event_queue) < self.MAX_QUEUE_SIZE:
+                self.event_queue.append(event_data)
+            else:
+                self.log(f"Event queue full, dropping event {event_suffix}")
+
+    def _handle_tracked_object_update(self, payload: Dict[str, Any]) -> None:
+        """Handle frigate/tracked_object_update messages for face recognition updates."""
+        if not self.face_detection_enabled:
+            return
+
+        update_type = payload.get("type")
+        if update_type == "face":
+            # Face recognition update - could be used for real-time updates
+            # For now, we'll just log it since we process face data from the main events
+            event_id = payload.get("id", "unknown")
+            face_name = payload.get("name", "unknown")
+            confidence = payload.get("score", 0.0)
+
+            if confidence >= self.face_detection_threshold:
+                self.log(f"Face recognition update: {face_name} (confidence: {confidence:.2f}) - Event ID: {event_id}")
 
     def _handle_notification_received(self, event_name: str, data: Dict[str, Any], kwargs: Dict[str, Any]) -> None:
         """Handle mobile app notification received events to track delivery times."""
@@ -303,14 +316,11 @@ class FrigateNotification(hass.Hass):
                     delivery_time = (current_time - original_datetime).total_seconds()
 
                 # Only record if delivery time is reasonable (positive and less than 1 hour)
-                if 0 <= delivery_time <= 3600:
+                if 0 <= delivery_time <= self.DELIVERY_TIME_THRESHOLD:
                     with self.metrics_lock:
                         self.delivery_times.append(delivery_time)
                         # Save metrics immediately after each delivery time
                         self._save_todays_metrics()
-
-                    event_id = notification_data.get('event_id', 'unknown')
-                    self.log(f"Notification delivered in {delivery_time:.3f}s - Event ID: {event_id}")
 
             except ValueError as e:
                 line_num = sys.exc_info()[2].tb_lineno
@@ -332,13 +342,34 @@ class FrigateNotification(hass.Hass):
             label = event_data.get("label", "Unknown")
             entered_zones = event_data.get("entered_zones", [])
 
+            # Extract face detection data - sub_label is an array: [name, confidence]
+            sub_label = event_data.get("sub_label")
+            top_score = event_data.get("top_score", 0.0)
+            face_detected = None
+            face_confidence = None
+
+            # Check if face detection is enabled and we have valid sub_label data
+            if (self.face_detection_enabled and sub_label and
+                isinstance(sub_label, list) and len(sub_label) >= 2):
+                face_name, confidence = sub_label[0], sub_label[1]
+                if (isinstance(face_name, str) and isinstance(confidence, (int, float)) and
+                    confidence >= self.face_detection_threshold):
+                    face_detected = face_name.strip()
+                    face_confidence = float(confidence)
+
             return {
                 "event_id": event_id,
                 "camera": camera,
                 "label": label,
                 "entered_zones": entered_zones,
                 "event_type": payload.get("type", ""),
-                "timestamp": datetime.now()
+                "timestamp": datetime.now(),
+                "face_detected": face_detected,
+                "face_confidence": face_confidence,
+                "top_score": top_score,
+                "current_zones": event_data.get("current_zones", []),
+                "stationary": event_data.get("stationary", False),
+                "false_positive": event_data.get("false_positive", False)
             }
 
         except Exception as e:
@@ -385,105 +416,80 @@ class FrigateNotification(hass.Hass):
             line_num = sys.exc_info()[2].tb_lineno
             self.log(f"ERROR: Failed to download and notify for event {event_id}: {e} (line {line_num})", level="ERROR")
 
-    def _has_potential_recipients(self, event_data: Dict[str, Any]) -> bool:
-        """Check if any user would receive notifications for this event."""
-        if not self.person_configs:
-            return False
-
-        camera = event_data["camera"]
-        label = event_data["label"]
-        entered_zones = event_data["entered_zones"]
-        current_time = time.time()
-
-        for config in self.person_configs:
-            # Skip if user disabled, wrong label, camera, or zone
-            if (not config["enabled"] or
-                label not in config["labels"] or
-                (config["cameras"] and camera not in config["cameras"]) or
-                (config["zones"] and not any(zone in config["zones"] for zone in entered_zones))):
-                continue
-
-            # Check cooldown period
-            cooldown_key = f"{config['notify']}/{camera}"
-            if current_time - self.msg_cooldown.get(cooldown_key, 0) >= config["cooldown"]:
-                return True
-
-        return False
-
     def _should_notify_user(self, config: Dict[str, Any], event_data: Dict[str, Any], current_time: float) -> bool:
         """Check if a user should receive a notification for this event."""
         camera = event_data["camera"]
         label = event_data["label"]
         entered_zones = event_data["entered_zones"]
+        current_zones = event_data.get("current_zones", [])
 
         # Check user enabled, label match, camera match, and zone match
+        # Use both entered_zones and current_zones for more accurate zone matching
+        user_zones = config.get("zones")
+        zone_match = (not user_zones or
+                     any(zone in user_zones for zone in entered_zones) or
+                     any(zone in user_zones for zone in current_zones))
+
         if (not config["enabled"] or
             label not in config["labels"] or
             (config["cameras"] and camera not in config["cameras"]) or
-            (config["zones"] and not any(zone in config["zones"] for zone in entered_zones))):
+            not zone_match):
             return False
 
         # Check cooldown period
         cooldown_key = f"{config['notify']}/{camera}"
         return current_time - self.msg_cooldown.get(cooldown_key, 0) >= config["cooldown"]
 
+    def _has_potential_recipients(self, event_data: Dict[str, Any]) -> bool:
+        """Check if any user would receive notifications for this event."""
+        if not self.person_configs:
+            return False
+
+        current_time = time.time()
+        return any(self._should_notify_user(config, event_data, current_time) for config in self.person_configs)
+
     def _is_circuit_closed(self, circuit_key: str) -> bool:
         """Check if circuit breaker is closed (allowing requests)."""
         with self.circuit_breaker_lock:
-            if circuit_key not in self.circuit_breaker_state:
+            state_info = self.circuit_breaker_state.get(circuit_key)
+            if not state_info:
                 return True
 
-            state_info = self.circuit_breaker_state[circuit_key]
+            state = state_info["state"]
+            if state == "closed":
+                return True
+
             current_time = time.time()
-
-            # Circuit breaker states:
-            # - closed: normal operation
-            # - open: blocking requests due to failures
-            # - half_open: allowing single test request
-
-            if state_info["state"] == "closed":
+            if state == "open" and current_time - state_info["last_failure"] > self.CIRCUIT_BREAKER_TIMEOUT:
+                state_info["state"] = "half_open"
                 return True
-            elif state_info["state"] == "open":
-                # Check if enough time has passed to try half-open
-                if current_time - state_info["last_failure"] > 60:  # 60 second timeout
-                    state_info["state"] = "half_open"
-                    return True
-                return False
-            elif state_info["state"] == "half_open":
-                # Only allow one request in half-open state
+            elif state == "half_open":
                 state_info["state"] = "open"  # Block further requests until success/failure
                 return True
 
-        return True
+            return state != "open"
 
     def _record_circuit_failure(self, circuit_key: str) -> None:
         """Record a failure for circuit breaker tracking."""
         with self.circuit_breaker_lock:
-            if circuit_key not in self.circuit_breaker_state:
-                self.circuit_breaker_state[circuit_key] = {
-                    "failures": 0,
-                    "last_failure": 0,
-                    "state": "closed"
-                }
+            state_info = self.circuit_breaker_state.setdefault(circuit_key, {
+                "failures": 0, "last_failure": 0, "state": "closed"
+            })
 
-            state_info = self.circuit_breaker_state[circuit_key]
             state_info["failures"] += 1
             state_info["last_failure"] = time.time()
 
-            # Open circuit if too many failures (5 failures triggers open state)
-            if state_info["failures"] >= 5:
+            # Open circuit if too many failures
+            if state_info["failures"] >= self.CIRCUIT_BREAKER_FAILURE_THRESHOLD:
                 state_info["state"] = "open"
                 self.log(f"Circuit breaker OPENED for {circuit_key} due to {state_info['failures']} failures")
 
     def _reset_circuit_breaker(self, circuit_key: str) -> None:
         """Reset circuit breaker after successful operation."""
         with self.circuit_breaker_lock:
-            if circuit_key in self.circuit_breaker_state:
-                self.circuit_breaker_state[circuit_key] = {
-                    "failures": 0,
-                    "last_failure": 0,
-                    "state": "closed"
-                }
+            state_info = self.circuit_breaker_state.get(circuit_key)
+            if state_info:
+                state_info.update({"failures": 0, "last_failure": 0, "state": "closed"})
 
     def _is_retryable_error(self, error: Exception) -> bool:
         """Determine if an error is retryable based on error type and message."""
@@ -599,11 +605,15 @@ class FrigateNotification(hass.Hass):
 
         # Check cache first
         with self.cache_lock:
-            if cache_key in self.file_cache:
-                cache_entry = self.file_cache[cache_key]
+            cache_entry = self.file_cache.get(cache_key)
+            if cache_entry:
                 cache_age = (datetime.now() - cache_entry["timestamp"]).total_seconds()
                 if cache_age < self.cache_ttl_hours * 3600:
-                    return cache_entry["file_path"]
+                    # Return relative path for consistency
+                    cached_path = cache_entry["file_path"]
+                    if cached_path.startswith(str(self.snapshot_dir)):
+                        return str(Path(cached_path).relative_to(self.snapshot_dir))
+                    return cached_path
 
         # Download new media
         now = datetime.now()
@@ -614,18 +624,18 @@ class FrigateNotification(hass.Hass):
 
         filename = f"{timestamp}--{event_id}{extension}"
         target_path = target_dir / filename
+        relative_path = f"{camera}/{date_dir}/{filename}"
 
         if target_path.exists():
             # Add existing file to cache
             with self.cache_lock:
-                file_size = target_path.stat().st_size
                 self.file_cache[cache_key] = {
                     "file_path": str(target_path),
-                    "timestamp": datetime.now(),
-                    "size": file_size,
-                    "checksum": hashlib.md5(f"{cache_key}_{file_size}".encode()).hexdigest()
+                    "timestamp": now,
+                    "size": target_path.stat().st_size,
+                    "checksum": hashlib.md5(f"{cache_key}_{target_path.stat().st_size}".encode()).hexdigest()
                 }
-            return f"{camera}/{date_dir}/{filename}"
+            return relative_path
 
         media_url = f"{self.frigate_url}/{event_id}/{endpoint}"
         req = urllib.request.Request(media_url)
@@ -642,7 +652,7 @@ class FrigateNotification(hass.Hass):
                 # Validate file size
                 if file_size == 0:
                     raise ValueError("File is empty: 0 bytes")
-                if file_size < 50000:  # Minimum 50KB for images
+                if file_size < self.MIN_FILE_SIZE_BYTES:  # Minimum 50KB for images
                     raise ValueError(f"File too small: {file_size} bytes")
 
                 # Write file to disk
@@ -653,11 +663,11 @@ class FrigateNotification(hass.Hass):
             with self.cache_lock:
                 self.file_cache[cache_key] = {
                     "file_path": str(target_path),
-                    "timestamp": datetime.now(),
+                    "timestamp": now,
                     "size": file_size,
                     "checksum": hashlib.md5(f"{cache_key}_{file_size}".encode()).hexdigest()
                 }
-            return f"{camera}/{date_dir}/{filename}"
+            return relative_path
 
         except Exception:
             # Clean up partial file on error
@@ -719,7 +729,6 @@ class FrigateNotification(hass.Hass):
             "confirmation": True
         }
 
-        # Add media to notification (image only now)
         # Add image to notification if available
         if media_path and self.ext_domain and media_type == "image":
             media_url = f"{self.ext_domain}/local/frigate/{media_path.lstrip('/')}"
@@ -728,9 +737,13 @@ class FrigateNotification(hass.Hass):
         # Send notifications to eligible users
         notifications_sent = 0
         current_time = time.time()
-        title = f"{label} @ {camera}"
+
+        # Build notification title with face detection if available
+        face_detected = event_data.get("face_detected")
+        title = f"{face_detected} ({label}) @ {camera}" if face_detected else f"{label} @ {camera}"
         message = f"{timestamp} - {zone_str} (ID: {event_id})"
         media_info = f" - {media_type}: {media_path}" if media_path else " - no media"
+        face_info = f" - Face: {face_detected}" if face_detected else ""
 
         for config in self.person_configs:
             # Skip if user doesn't match criteria or is in cooldown
@@ -743,7 +756,9 @@ class FrigateNotification(hass.Hass):
             self.msg_cooldown[cooldown_key] = current_time
             notifications_sent += 1
 
-            self.log(f"Notification sent to {config['name']} - {title} - Event ID: {event_id}{media_info}")
+            # Include face confidence in logging if available
+            face_confidence_info = f" (confidence: {event_data.get('face_confidence', 0):.2f})" if face_detected else ""
+            self.log(f"Notification sent to {config['name']} - {title} - Event ID: {event_id}{media_info}{face_info}{face_confidence_info}")
 
         # Record metrics and log completion
         notification_time = time.time() - notification_start
@@ -761,41 +776,24 @@ class FrigateNotification(hass.Hass):
                     self.log("METRICS: No notifications sent today")
                     return
 
-                # Calculate statistics using consolidated method
-                stats = {}
+                # Calculate statistics directly
+                log_parts = ["METRICS:"]
+
                 if self.notification_times:
-                    stats.update(self._create_metrics_dict(self.notification_times, "notification"))
-                    # Add backward compatibility keys
-                    stats["total_notifications"] = stats.get("total_notification", 0)
-                    stats["min_seconds"] = stats.get("min_notification_seconds", 0)
-                    stats["avg_seconds"] = stats.get("avg_notification_seconds", 0)
-                    stats["max_seconds"] = stats.get("max_notification_seconds", 0)
+                    count = len(self.notification_times)
+                    avg_time = sum(self.notification_times) / count
+                    min_time = min(self.notification_times)
+                    max_time = max(self.notification_times)
+                    log_parts.append(f"Notifications={count}, Min={min_time:.3f}s, Avg={avg_time:.3f}s, Max={max_time:.3f}s")
 
                 if self.delivery_times:
-                    delivery_stats = self._create_metrics_dict(self.delivery_times, "delivery")
-                    stats.update({
-                        "total_deliveries": delivery_stats.get("total_delivery", 0),
-                        "min_delivery_seconds": delivery_stats.get("min_delivery_seconds", 0),
-                        "avg_delivery_seconds": delivery_stats.get("avg_delivery_seconds", 0),
-                        "max_delivery_seconds": delivery_stats.get("max_delivery_seconds", 0)
-                    })
+                    count = len(self.delivery_times)
+                    avg_time = sum(self.delivery_times) / count
+                    min_time = min(self.delivery_times)
+                    max_time = max(self.delivery_times)
+                    log_parts.append(f"Deliveries={count}, Min={min_time:.3f}s, Avg={avg_time:.3f}s, Max={max_time:.3f}s")
 
-                # Build efficient log message
-                log_components = ["METRICS:"]
-
-                if "total_notifications" in stats:
-                    log_components.append(
-                        f"Notifications={stats['total_notifications']}, Min={stats['min_seconds']}s, "
-                        f"Avg={stats['avg_seconds']}s, Max={stats['max_seconds']}s"
-                    )
-
-                if "total_deliveries" in stats:
-                    log_components.append(
-                        f"Deliveries={stats['total_deliveries']}, Min={stats['min_delivery_seconds']}s, "
-                        f"Avg={stats['avg_delivery_seconds']}s, Max={stats['max_delivery_seconds']}s"
-                    )
-
-                self.log(" | ".join(log_components))
+                self.log(" | ".join(log_parts))
 
                 # Clear today's data for next day
                 self.notification_times.clear()
@@ -865,69 +863,6 @@ class FrigateNotification(hass.Hass):
         except Exception as e:
             self.log(f"ERROR: Failed to save today's metrics: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
-    def _enrich_yesterdays_metrics(self) -> None:
-        """Enrich yesterday's metrics with calculated statistics (min, avg, max, std)."""
-        try:
-            if not self.metrics_file.exists():
-                return
-
-            with open(self.metrics_file, 'r') as f:
-                data = json.load(f)
-
-            yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-
-            # Find yesterday's entry
-            for entry in data.get("daily_metrics", []):
-                if entry.get("date") == yesterday:
-                    # Enrich notification and delivery times with statistics
-                    for metric_type in ["notification", "delivery"]:
-                        key = f"{metric_type}_times"
-                        if key in entry and entry[key]:
-                            times = entry[key]
-                            entry[key] = self._create_metrics_dict(times, metric_type, include_raw=True)
-                            metrics = entry[key]
-                            self.log(
-                                f"Enriched yesterday's {metric_type} metrics: {metrics[f'total_{metric_type}']} events, "
-                                f"min={metrics[f'min_{metric_type}_seconds']}s, "
-                                f"avg={metrics[f'avg_{metric_type}_seconds']}s, "
-                                f"max={metrics[f'max_{metric_type}_seconds']}s, "
-                                f"std={metrics[f'std_{metric_type}_seconds']}s"
-                            )
-
-                    # Save the enriched data back to file
-                    with open(self.metrics_file, 'w') as f:
-                        json.dump(data, f, indent=2)
-
-                    return
-
-        except Exception as e:
-            line_num = sys.exc_info()[2].tb_lineno
-            self.log(f"ERROR: Failed to enrich yesterday's metrics: {e} (line {line_num})", level="ERROR")
-
-    def _load_yesterday_metrics(self) -> Optional[Dict[str, Any]]:
-        """Load yesterday's metrics from file."""
-        try:
-            if not self.metrics_file.exists():
-                return None
-
-            with open(self.metrics_file, 'r') as f:
-                data = json.load(f)
-
-            yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-            for entry in data.get("daily_metrics", []):
-                if entry.get("date") == yesterday:
-                    result = {"date": entry["date"]}
-                    result.update(self._extract_metrics_from_entry(entry, "notification"))
-                    result.update(self._extract_metrics_from_entry(entry, "delivery"))
-                    return result
-
-            return None
-
-        except Exception as e:
-            line_num = sys.exc_info()[2].tb_lineno
-            self.log(f"ERROR: Failed to load yesterday's metrics: {e} (line {line_num})", level="ERROR")
-            return None
-
     def _cleanup_old_files(self, **kwargs) -> None:
         """Clean up old image files to prevent disk space issues."""
         if not self.snapshot_dir or not self.snapshot_dir.exists():
@@ -955,15 +890,15 @@ class FrigateNotification(hass.Hass):
             cutoff_time = datetime.now() - timedelta(hours=self.cache_ttl_hours)
 
             with self.cache_lock:
-                # Remove expired entries
-                expired_keys = [key for key, entry in self.file_cache.items() if entry["timestamp"] < cutoff_time]
+                # Remove expired entries using list() to avoid RuntimeError during iteration
+                expired_keys = list(key for key, entry in self.file_cache.items() if entry["timestamp"] < cutoff_time)
                 for key in expired_keys:
                     del self.file_cache[key]
 
                 # Limit cache size if needed
-                if len(self.file_cache) > 1000:
+                if len(self.file_cache) > self.MAX_CACHE_SIZE:
                     # Sort by timestamp and remove oldest entries
-                    entries_to_remove = len(self.file_cache) - 1000
+                    entries_to_remove = len(self.file_cache) - self.MAX_CACHE_SIZE
                     sorted_entries = sorted(self.file_cache.items(), key=lambda x: x[1]["timestamp"])
                     for key, _ in sorted_entries[:entries_to_remove]:
                         del self.file_cache[key]
@@ -978,7 +913,7 @@ class FrigateNotification(hass.Hass):
         """Clean up notified events set to prevent memory leaks."""
         try:
             with self.notification_lock:
-                if len(self.notified_events) > 1000:
+                if len(self.notified_events) > self.MAX_NOTIFIED_EVENTS:
                     # Keep only the most recent 500 events
                     self.notified_events.clear()
                     self.log("Cleaned up notified events set to prevent memory leaks")

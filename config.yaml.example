@@ -23,6 +23,10 @@ frigate_notify:
   cache_ttl_hours: 24      # Hours to keep cache entries
   connection_timeout: 30   # Connection timeout in seconds
 
+  # Face Detection Settings
+  face_detection_enabled: true    # Enable/disable face detection features
+  face_detection_threshold: 0.7   # Minimum confidence threshold for face detection (0.0-1.0)
+
   # User Notifications
   persons:
     - name: "Primary User"
