@@ -33,7 +33,6 @@ Configuration:
 
 import hashlib
 import json
-import random
 import sys
 import threading
 import time
@@ -45,8 +44,6 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import appdaemon.plugins.hass.hassapi as hass
-
-
 class FrigateNotification(hass.Hass):
     """AppDaemon app for sending Frigate motion notifications."""
 
@@ -54,10 +51,7 @@ class FrigateNotification(hass.Hass):
     MAX_QUEUE_SIZE = 1000
     MAX_CACHE_SIZE = 1000
     MAX_NOTIFIED_EVENTS = 1000
-    CIRCUIT_BREAKER_TIMEOUT = 60
-    CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5
     MIN_FILE_SIZE_BYTES = 50000
-    DELIVERY_TIME_THRESHOLD = 3600
 
     def initialize(self) -> None:
         """Initialize the Frigate notification app."""
@@ -71,28 +65,12 @@ class FrigateNotification(hass.Hass):
         self.file_cache = {}
         self.cache_lock = threading.Lock()
 
-        # Metrics tracking
-        self.notification_times = []
-        self.delivery_times = []
-        self.metrics_lock = threading.Lock()
-        self.metrics_file = Path(__file__).parent / "notification_metrics.json"
-
         # Duplicate notification prevention
-        self.notified_events = set()  # Track events that have already been notified
+        self.notified_events = set()
         self.notification_lock = threading.Lock()
-
-        # Circuit breaker for download failures
-        self.circuit_breaker_state = {}
-        self.circuit_breaker_lock = threading.Lock()
-
-        # Load today's metrics on startup
-        self._load_todays_metrics()
 
         self._load_config()
         self._setup_mqtt()
-
-        # Set up notification delivery tracking
-        self.listen_event(self._handle_notification_received, "mobile_app_notification_received")
 
         # Start processing thread
         self.processing_thread = threading.Thread(
@@ -102,14 +80,9 @@ class FrigateNotification(hass.Hass):
 
         # Schedule periodic tasks
         self.run_every(self._cleanup_old_files, datetime.now(), 24 * 60 * 60)
-        self.run_every(
-            self._log_daily_metrics,
-            datetime.now().replace(hour=23, minute=59, second=0, microsecond=0),
-            24 * 60 * 60
-        )
+
         self.run_every(self._cleanup_cache, datetime.now(), 6 * 60 * 60)
         self.run_every(self._cleanup_notified_events, datetime.now(), 60 * 60)  # Every hour
-        self.run_every(self._cleanup_circuit_breakers, datetime.now(), 12 * 60 * 60)  # Every 12 hours
 
     def _load_config(self) -> None:
         """Load and validate configuration parameters."""
@@ -144,6 +117,13 @@ class FrigateNotification(hass.Hass):
 
         self._load_person_configs()
 
+    def _log_error(self, message: str, exception: Exception) -> None:
+        """Log error with line number information."""
+        line_num = sys.exc_info()[2].tb_lineno
+        self.log(f"ERROR: {message}: {exception} (line {line_num})", level="ERROR")
+
+
+
     def _load_person_configs(self) -> None:
         """Load and validate person notification configurations."""
         for person_data in self.args.get("persons", []):
@@ -170,8 +150,7 @@ class FrigateNotification(hass.Hass):
                 self.person_configs.append(config)
 
             except Exception as e:
-                line_num = sys.exc_info()[2].tb_lineno
-                self.log(f"ERROR: Failed to load person config: {e} (line {line_num})", level="ERROR")
+                self._log_error("Failed to load person config", e)
 
     def _setup_mqtt(self) -> None:
         """Set up MQTT connection and subscribe to Frigate events."""
@@ -183,7 +162,7 @@ class FrigateNotification(hass.Hass):
             else:
                 self.log("ERROR: MQTT not connected", level="ERROR")
         except Exception as e:
-            self.log(f"ERROR: Failed to set up MQTT: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
+            self._log_error("Failed to set up MQTT", e)
 
     def _event_processing_worker(self) -> None:
         """Background worker thread for processing queued events."""
@@ -191,12 +170,18 @@ class FrigateNotification(hass.Hass):
             try:
                 with self.queue_lock:
                     if self.event_queue:
-                        self._process_event(self.event_queue.popleft())
+                        # Process event
+                        event_data = self.event_queue.popleft()
+                        try:
+                            if self.only_zones and not event_data["entered_zones"]:
+                                continue
+                            self.executor.submit(self._download_and_notify, event_data)
+                        except Exception as e:
+                            self._log_error("Failed to process event", e)
                     else:
                         time.sleep(0.1)
             except Exception as e:
-                line_num = sys.exc_info()[2].tb_lineno
-                self.log(f"ERROR: Event processing worker error: {e} (line {line_num})", level="ERROR")
+                self._log_error("Event processing worker error", e)
 
     def _handle_mqtt_message(self, event_name: str, data: Dict[str, Any], kwargs: Dict[str, Any]) -> None:
         """Handle incoming MQTT messages from Frigate."""
@@ -217,71 +202,26 @@ class FrigateNotification(hass.Hass):
                     self.log("ERROR: Invalid JSON payload", level="ERROR")
                     return
 
-            self._handle_events_message(payload)
-
-        except Exception as e:
-            line_num = sys.exc_info()[2].tb_lineno
-            self.log(f"ERROR: Failed to process MQTT message: {e} (line {line_num})", level="ERROR")
-
-    def _handle_events_message(self, payload: Dict[str, Any]) -> None:
-        """Handle frigate/events messages."""
-        event_data = self._extract_event_data(payload)
-        if (not event_data or event_data["event_type"] != "end" or
-            event_data.get("false_positive", False) or
-            not self._has_potential_recipients(event_data)):
-            return
-
-        # Queue event for processing
-        with self.queue_lock:
-            if len(self.event_queue) < self.MAX_QUEUE_SIZE:
-                self.event_queue.append(event_data)
-            else:
-                event_id = event_data["event_id"]
-                event_suffix = event_id.split('-')[-1] if '-' in event_id else event_id
-                self.log(f"Event queue full, dropping event {event_suffix}")
-
-
-
-    def _handle_notification_received(self, event_name: str, data: Dict[str, Any], kwargs: Dict[str, Any]) -> None:
-        """Handle mobile app notification received events to track delivery times."""
-        try:
-            if not data or 'data' not in data:
+            # Handle frigate/events messages
+            event_data = self._extract_event_data(payload)
+            if (not event_data or event_data["event_type"] != "end" or
+                event_data.get("false_positive", False) or
+                not self._has_potential_recipients(event_data)):
                 return
 
-            notification_data = data['data']
-            if not notification_data or 'timestamp' not in notification_data:
-                return
-
-            # Parse the original timestamp from the notification
-            try:
-                original_timestamp = datetime.strptime(notification_data['timestamp'], "%H:%M:%S")
-                # Use today's date since we only have time
-                today = datetime.now().date()
-                original_datetime = datetime.combine(today, original_timestamp.time())
-
-                # Calculate delivery time
-                current_time = datetime.now()
-                delivery_time = (current_time - original_datetime).total_seconds()
-
-                # Handle cross-midnight scenario (if delivery time is negative, assume previous day)
-                if delivery_time < 0:
-                    original_datetime = datetime.combine(today - timedelta(days=1), original_timestamp.time())
-                    delivery_time = (current_time - original_datetime).total_seconds()
-
-                # Only record if delivery time is reasonable (positive and less than 1 hour)
-                if 0 <= delivery_time <= self.DELIVERY_TIME_THRESHOLD:
-                    with self.metrics_lock:
-                        self.delivery_times.append(delivery_time)
-                        # Save metrics immediately after each delivery time
-                        self._save_todays_metrics()
-
-            except ValueError as e:
-                line_num = sys.exc_info()[2].tb_lineno
-                self.log(f"ERROR: Failed to parse notification timestamp: {e} (line {line_num})", level="ERROR")
+            # Queue event for processing
+            with self.queue_lock:
+                if len(self.event_queue) < self.MAX_QUEUE_SIZE:
+                    self.event_queue.append(event_data)
+                else:
+                    event_id = event_data["event_id"]
+                    event_suffix = event_id.split('-')[-1] if '-' in event_id else event_id
+                    self.log(f"Event queue full, dropping event {event_suffix}")
 
         except Exception as e:
-            line_num = sys.exc_info()[2].tb_lineno
-            self.log(f"ERROR: Failed to process notification received event: {e} (line {line_num})", level="ERROR")
+            self._log_error("Failed to process MQTT message", e)
+
+
 
     def _extract_event_data(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Extract and validate event data from payload."""
@@ -296,16 +236,15 @@ class FrigateNotification(hass.Hass):
             entered_zones = event_data.get("entered_zones", [])
 
             # Extract face detection data - sub_label is an array: [name, confidence]
-            sub_label = event_data.get("sub_label")
-            top_score = event_data.get("top_score", 0.0)
             face_detected = None
             face_confidence = None
-
-            if (self.face_detection_enabled and sub_label and isinstance(sub_label, list) and
-                len(sub_label) >= 2 and isinstance(sub_label[0], str) and
-                isinstance(sub_label[1], (int, float)) and sub_label[1] >= self.face_detection_threshold):
-                face_detected = sub_label[0].strip()
-                face_confidence = sub_label[1]
+            if self.face_detection_enabled:
+                sub_label = event_data.get("sub_label")
+                if (sub_label and isinstance(sub_label, list) and len(sub_label) >= 2 and
+                    isinstance(sub_label[0], str) and isinstance(sub_label[1], (int, float)) and
+                    sub_label[1] >= self.face_detection_threshold):
+                    face_detected = sub_label[0].strip()
+                    face_confidence = sub_label[1]
 
             return {
                 "event_id": event_id,
@@ -316,25 +255,17 @@ class FrigateNotification(hass.Hass):
                 "timestamp": datetime.now(),
                 "face_detected": face_detected,
                 "face_confidence": face_confidence,
-                "top_score": top_score,
+                "top_score": event_data.get("top_score", 0.0),
                 "current_zones": event_data.get("current_zones", []),
                 "stationary": event_data.get("stationary", False),
                 "false_positive": event_data.get("false_positive", False)
             }
 
         except Exception as e:
-            self.log(f"ERROR: Failed to extract event data: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
+            self._log_error("Failed to extract event data", e)
             return None
 
-    def _process_event(self, event_data: Dict[str, Any]) -> None:
-        """Process a Frigate event."""
-        try:
-            if self.only_zones and not event_data["entered_zones"]:
-                return
-            self.executor.submit(self._download_and_notify, event_data)
-        except Exception as e:
-            line_num = sys.exc_info()[2].tb_lineno
-            self.log(f"ERROR: Failed to process event: {e} (line {line_num})", level="ERROR")
+
 
     def _download_and_notify(self, event_data: Dict[str, Any]) -> None:
         """Download media and send notifications for a Frigate event."""
@@ -342,20 +273,15 @@ class FrigateNotification(hass.Hass):
         event_suffix = event_id.split('-')[-1] if '-' in event_id else event_id
 
         try:
-            # Try to download snapshot image with intelligent retry
+            # Try to download snapshot image
             media_path = self._download_media_with_retry(
-                event_data["event_id"], event_data["camera"], "snapshot.jpg", ".jpg", 15, event_suffix
+                event_id, event_data["camera"], "snapshot.jpg", ".jpg", 15, event_suffix
             )
-            if media_path:
-                self._send_notifications(event_data, media_path, "image", event_suffix)
-                return
-
-            # Send notification without media if snapshot download failed
-            self._send_notifications(event_data, None, None, event_suffix)
+            media_type = "image" if media_path else None
+            self._send_notifications(event_data, media_path, media_type, event_suffix)
 
         except Exception as e:
-            line_num = sys.exc_info()[2].tb_lineno
-            self.log(f"ERROR: Failed to download and notify for event {event_id}: {e} (line {line_num})", level="ERROR")
+            self._log_error(f"Failed to download and notify for event {event_id}", e)
 
     def _should_notify_user(self, config: Dict[str, Any], event_data: Dict[str, Any], current_time: float) -> bool:
         """Check if a user should receive a notification for this event."""
@@ -385,133 +311,31 @@ class FrigateNotification(hass.Hass):
         current_time = time.time()
         return any(self._should_notify_user(config, event_data, current_time) for config in self.person_configs)
 
-    def _is_circuit_closed(self, circuit_key: str) -> bool:
-        """Check if circuit breaker is closed (allowing requests)."""
-        with self.circuit_breaker_lock:
-            state_info = self.circuit_breaker_state.get(circuit_key)
-            if not state_info:
-                return True
-
-            state = state_info["state"]
-            if state == "closed":
-                return True
-
-            current_time = time.time()
-            if state == "open" and current_time - state_info["last_failure"] > self.CIRCUIT_BREAKER_TIMEOUT:
-                state_info["state"] = "half_open"
-                return True
-            elif state == "half_open":
-                state_info["state"] = "open"  # Block further requests until success/failure
-                return True
-
-            return state != "open"
-
-    def _record_circuit_failure(self, circuit_key: str) -> None:
-        """Record a failure for circuit breaker tracking."""
-        with self.circuit_breaker_lock:
-            state_info = self.circuit_breaker_state.setdefault(circuit_key, {
-                "failures": 0, "last_failure": 0, "state": "closed"
-            })
-
-            state_info["failures"] += 1
-            state_info["last_failure"] = time.time()
-
-            # Open circuit if too many failures
-            if state_info["failures"] >= self.CIRCUIT_BREAKER_FAILURE_THRESHOLD:
-                state_info["state"] = "open"
-                self.log(f"Circuit breaker OPENED for {circuit_key} due to {state_info['failures']} failures")
-
-    def _reset_circuit_breaker(self, circuit_key: str) -> None:
-        """Reset circuit breaker after successful operation."""
-        with self.circuit_breaker_lock:
-            state_info = self.circuit_breaker_state.get(circuit_key)
-            if state_info:
-                state_info.update({"failures": 0, "last_failure": 0, "state": "closed"})
-
-    def _is_retryable_error(self, error: Exception) -> bool:
-        """Determine if an error is retryable based on error type and message."""
-        error_str = str(error).lower()
-        error_type = type(error).__name__
-
-        # Network-related errors that are typically retryable
-        retryable_errors = {
-            "TimeoutError", "ConnectionError", "URLError", "HTTPError"
-        }
-
-        # HTTP status codes that are retryable
-        retryable_http_statuses = {500, 502, 503, 504, 429}  # Server errors and rate limiting
-
-        # Check for specific retryable conditions
-        if error_type in retryable_errors:
-            return True
-
-        # Check for HTTP status codes in error message
-        for status in retryable_http_statuses:
-            if f"http error {status}" in error_str:
-                return True
-
-        # Check for common retryable error messages
-        retryable_messages = [
-            "timeout", "connection", "network", "temporary", "server error",
-            "service unavailable", "bad gateway", "gateway timeout"
-        ]
-
-        return any(msg in error_str for msg in retryable_messages)
-
     def _download_media_with_retry(
         self, event_id: str, camera: str, endpoint: str, extension: str,
         max_timeout: int, event_suffix: str
     ) -> Optional[str]:
-        """Download media with exponential backoff, jitter, and circuit breaker."""
-        circuit_key = f"{camera}_{endpoint}"
-
-        # Check circuit breaker state
-        if not self._is_circuit_closed(circuit_key):
-            self.log(f"Circuit breaker OPEN for {circuit_key}, skipping download")
-            return None
-
+        """Download media with exponential backoff and retry logic."""
         start_time = time.time()
-        attempt = 0
-        max_attempts = 5  # Maximum number of retry attempts
+        max_attempts = 3
 
-        while time.time() - start_time < max_timeout and attempt < max_attempts:
-            attempt += 1
+        for attempt in range(1, max_attempts + 1):
+            if time.time() - start_time >= max_timeout:
+                break
 
             try:
                 media_path = self._download_media(event_id, camera, endpoint, extension, event_suffix)
                 if media_path:
-                    # Success - reset circuit breaker
-                    self._reset_circuit_breaker(circuit_key)
                     return media_path
-                else:
-                    # No exception but no media path - record as failure
-                    self._record_circuit_failure(circuit_key)
-
             except Exception as e:
-                line_num = sys.exc_info()[2].tb_lineno
-                error_type = type(e).__name__
+                self._log_error(f"Media download attempt {attempt} failed for {event_id}", e)
 
-                # Determine if error is retryable
-                is_retryable = self._is_retryable_error(e)
-
-                self.log(
-                    f"ERROR: Media download attempt {attempt} failed for {event_id} ({error_type}): "
-                    f"{e} (line {line_num})",
-                    level="ERROR"
-                )
-
-                # Record failure for circuit breaker
-                self._record_circuit_failure(circuit_key)
-
-                # If not retryable or max attempts reached, exit early
-                if not is_retryable or attempt >= max_attempts:
+                if attempt >= max_attempts:
                     break
 
-                # Calculate exponential backoff with jitter if more attempts allowed
-            if attempt < max_attempts and time.time() - start_time < max_timeout:
-                base_delay = min(2 ** attempt, 8)  # 1s, 2s, 4s, 8s max
-                jitter = random.uniform(-0.25, 0.25) * base_delay  # ±25% jitter
-                delay = max(0.1, base_delay + jitter)  # Minimum 0.1s delay
+            # Simple exponential backoff for retry
+            if attempt < max_attempts:
+                delay = min(2 ** attempt, 4)  # 2s, 4s max
                 time.sleep(delay)
 
         return None
@@ -640,20 +464,17 @@ class FrigateNotification(hass.Hass):
         }
 
         # Add image to notification if available
-        if media_path and self.ext_domain and media_type == "image":
-            media_url = f"{self.ext_domain}/local/frigate/{media_path.lstrip('/')}"
-            notification_data["image"] = media_url
-
-        # Send notifications to eligible users
-        notifications_sent = 0
-        current_time = time.time()
+        if media_path and media_type == "image":
+            notification_data["image"] = f"{self.ext_domain}/local/frigate/{media_path.lstrip('/')}"
 
         # Build notification content
         face_detected = event_data.get("face_detected")
         title = f"{face_detected} ({label}) @ {camera}" if face_detected else f"{label} @ {camera}"
         message = f"{timestamp} - {zone_str} (ID: {event_id})"
 
-        # Prepare logging info
+        # Send notifications to eligible users
+        notifications_sent = 0
+        current_time = time.time()
         media_info = f" - {media_type}: {media_path}" if media_path else " - no media"
         face_info = f" - Face: {face_detected}" if face_detected else ""
 
@@ -670,101 +491,9 @@ class FrigateNotification(hass.Hass):
             face_confidence_info = f" (confidence: {face_confidence:.2f})" if face_detected and face_confidence else ""
             self.log(f"Notification sent to {config['name']} - {title} - Event ID: {event_id}{media_info}{face_info}{face_confidence_info}")
 
-        # Record metrics and log completion
-        notification_time = time.time() - notification_start
-        with self.metrics_lock:
-            self.notification_times.append(notification_time)
-
         if notifications_sent > 0:
+            notification_time = time.time() - notification_start
             self.log(f"Sent {notifications_sent} notifications for {event_id} in {notification_time:.3f}s")
-
-    def _log_daily_metrics(self, **kwargs) -> None:
-        """Log daily notification performance metrics and enrich previous day's data."""
-        try:
-            with self.metrics_lock:
-                if not self.notification_times and not self.delivery_times:
-                    self.log("METRICS: No notifications sent today")
-                    return
-
-                log_parts = ["METRICS:"]
-
-                for times, label in [(self.notification_times, "Notifications"), (self.delivery_times, "Deliveries")]:
-                    if times:
-                        count = len(times)
-                        avg_time = sum(times) / count
-                        min_time = min(times)
-                        max_time = max(times)
-                        log_parts.append(f"{label}={count}, Min={min_time:.3f}s, Avg={avg_time:.3f}s, Max={max_time:.3f}s")
-
-                self.log(" | ".join(log_parts))
-
-                # Clear today's data for next day
-                self.notification_times.clear()
-                self.delivery_times.clear()
-
-        except Exception as e:
-            self.log(f"ERROR: Failed to log daily metrics: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
-
-    def _load_todays_metrics(self) -> None:
-        """Load today's metrics from file on startup."""
-        try:
-            if not self.metrics_file.exists():
-                return
-
-            with open(self.metrics_file, 'r') as f:
-                data = json.load(f)
-
-            today = datetime.now().strftime("%Y-%m-%d")
-            for entry in data.get("daily_metrics", []):
-                if entry.get("date") == today:
-                    # Load today's data back into memory
-                    if "notification_times" in entry:
-                        self.notification_times = entry["notification_times"]
-                    if "delivery_times" in entry:
-                        self.delivery_times = entry["delivery_times"]
-
-                    return
-
-        except Exception as e:
-            self.log(f"ERROR: Failed to load today's metrics: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
-
-    def _save_todays_metrics(self) -> None:
-        """Save today's current metrics to file."""
-        try:
-            today = datetime.now().strftime("%Y-%m-%d")
-
-            # Load existing data
-            if self.metrics_file.exists():
-                with open(self.metrics_file, 'r') as f:
-                    data = json.load(f)
-            else:
-                data = {"daily_metrics": []}
-
-            # Find today's entry or create new one
-            today_entry = None
-            for entry in data["daily_metrics"]:
-                if entry.get("date") == today:
-                    today_entry = entry
-                    break
-
-            if not today_entry:
-                today_entry = {"date": today}
-                data["daily_metrics"].append(today_entry)
-
-            # Update today's entry with current data
-            today_entry["notification_times"] = self.notification_times.copy()
-            today_entry["delivery_times"] = self.delivery_times.copy()
-
-            # Keep only last 30 days
-            if len(data["daily_metrics"]) > 30:
-                data["daily_metrics"] = data["daily_metrics"][-30:]
-
-            # Save to file
-            with open(self.metrics_file, 'w') as f:
-                json.dump(data, f, indent=2)
-
-        except Exception as e:
-            self.log(f"ERROR: Failed to save today's metrics: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
     def _cleanup_old_files(self, **kwargs) -> None:
         """Clean up old image files to prevent disk space issues."""
@@ -784,7 +513,7 @@ class FrigateNotification(hass.Hass):
                 self.log(f"Cleaned up {files_removed} old image files")
 
         except Exception as e:
-            self.log(f"ERROR: Failed to cleanup old files: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
+            self._log_error("Failed to cleanup old files", e)
 
     def _cleanup_cache(self, **kwargs) -> None:
         """Clean up expired cache entries and limit cache size."""
@@ -806,7 +535,7 @@ class FrigateNotification(hass.Hass):
                 self.log(f"Cleaned up {len(expired_keys)} expired cache entries")
 
         except Exception as e:
-            self.log(f"ERROR: Failed to cleanup cache: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
+            self._log_error("Failed to cleanup cache", e)
 
     def _cleanup_notified_events(self, **kwargs) -> None:
         """Clean up notified events set to prevent memory leaks."""
@@ -816,25 +545,7 @@ class FrigateNotification(hass.Hass):
                     self.notified_events.clear()
                     self.log("Cleaned up notified events set to prevent memory leaks")
         except Exception as e:
-            line_num = sys.exc_info()[2].tb_lineno
-            self.log(f"ERROR: Failed to cleanup notified events: {e} (line {line_num})", level="ERROR")
-
-    def _cleanup_circuit_breakers(self, **kwargs) -> None:
-        """Clean up old circuit breaker states to prevent memory leaks."""
-        try:
-            current_time = time.time()
-            with self.circuit_breaker_lock:
-                keys_to_remove = [key for key, state in self.circuit_breaker_state.items()
-                                 if current_time - state["last_failure"] > 86400]  # 24 hours
-
-                for key in keys_to_remove:
-                    del self.circuit_breaker_state[key]
-
-                if keys_to_remove:
-                    self.log(f"Cleaned up {len(keys_to_remove)} old circuit breaker states")
-        except Exception as e:
-            line_num = sys.exc_info()[2].tb_lineno
-            self.log(f"ERROR: Failed to cleanup circuit breakers: {e} (line {line_num})", level="ERROR")
+            self._log_error("Failed to cleanup notified events", e)
 
     def terminate(self) -> None:
         """Cleanup when app is terminated."""

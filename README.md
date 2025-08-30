@@ -19,7 +19,7 @@ A sophisticated AppDaemon application that listens to Frigate MQTT events and se
 - **Async Processing**: Non-blocking event processing with thread pools
 - **Retry Logic**: Automatic retry for failed downloads
 - **File Cleanup**: Automatic cleanup of old video files
-- **Metrics Tracking**: Comprehensive metrics for monitoring
+
 - **Memory Management**: Efficient memory usage with structured data
 - **Intelligent Caching**: Prevents duplicate downloads with TTL-based cache
 - **Connection Monitoring**: Real-time MQTT connection health tracking
@@ -51,7 +51,7 @@ frigate_notify:
 ```yaml
   # Advanced Settings
   max_file_age_days: 30    # Days to keep video files before cleanup
-  enable_metrics: true     # Enable metrics logging
+
   cache_ttl_hours: 24      # Hours to keep cache entries
   connection_timeout: 30   # Connection timeout in seconds
 ```
@@ -104,7 +104,7 @@ frigate_notify:
 | `only_zones` | boolean | No | Only notify when objects enter zones (default: false) |
 
 | `max_file_age_days` | integer | No | Days to keep files (default: 30) |
-| `enable_metrics` | boolean | No | Enable metrics logging (default: true) |
+
 | `cache_ttl_hours` | integer | No | Cache time-to-live in hours (default: 24) |
 | `connection_timeout` | integer | No | Network timeout in seconds (default: 30) |
 | `persons` | list | Yes | List of users to notify |
@@ -132,7 +132,6 @@ frigate_notify:
 6. **User Filtering**: Checks each user's preferences (labels, zones, cameras, cooldown, priority)
 7. **Notification**: Sends rich notifications with video links and camera shortcuts
 8. **Cleanup**: Automatically removes old video files and cache entries
-9. **Monitoring**: Tracks performance, connection health, and usage statistics
 
 ## Advanced Features
 
@@ -162,24 +161,16 @@ frigate_notify:
 - Non-blocking MQTT message handling
 
 ### Intelligent Media Download Logic
-- **Exponential Backoff**: Retry delays increase exponentially (1s, 2s, 4s, 8s) with random jitter
-- **Circuit Breaker Pattern**: Prevents cascade failures by temporarily blocking requests after persistent failures
-- **Adaptive Retry Logic**: Different retry strategies based on error types (network vs server errors)
-- **Smart Error Classification**: Distinguishes between retryable and non-retryable errors
-- **Automatic Recovery**: Circuit breakers automatically test and recover from failure states
-- **Memory Efficient**: Automatic cleanup of old circuit breaker states
+- **Exponential Backoff**: Retry delays increase exponentially (2s, 4s) for failed downloads
+- **Adaptive Retry Logic**: Simple retry strategy with timeout protection
+- **Graceful Failure Handling**: Downloads fail gracefully and send notifications without media
 
 ### File Management
 - Automatic cleanup of old video files
 - Configurable retention period
 - Prevents disk space issues
 
-### Metrics Tracking
-- Comprehensive metrics for monitoring
-- Event processing statistics
-- Download success/failure rates
-- Cooldown and filtering statistics
-- Queue size and processing time tracking
+
 
 ### Enhanced Filtering
 - Filter by specific zones per user
@@ -218,29 +209,7 @@ frigate_notify:
 - **Async Processing**: Non-blocking event handling
 - **Intelligent Caching**: Reduces redundant downloads
 
-## Monitoring and Metrics
 
-The app provides comprehensive metrics that are logged hourly:
-
-```
-METRICS: Events=150, Processed=145, Notifications=89,
-Downloads=67/3, CooldownSkipped=23, LabelFiltered=12,
-ZoneFiltered=8, Errors=2, QueueSize=5,
-AvgProcessingTime=0.125s, Connection=connected
-```
-
-### Metrics Explained
-- **Events**: Total MQTT events received
-- **Processed**: Events that passed initial validation
-- **Notifications**: Notifications actually sent
-- **Downloads**: Successful/failed video downloads
-- **CooldownSkipped**: Events skipped due to cooldown
-- **LabelFiltered**: Events filtered by label preferences
-- **ZoneFiltered**: Events filtered by zone settings
-- **Errors**: Total errors encountered
-- **QueueSize**: Current event queue size
-- **AvgProcessingTime**: Average time to process events
-- **Connection**: Current MQTT connection status
 
 ## Troubleshooting
 
@@ -262,18 +231,16 @@ AvgProcessingTime=0.125s, Connection=connected
 3. **MQTT connection issues**
    - Verify MQTT plugin is configured in AppDaemon
    - Check topic configuration matches Frigate
-   - Monitor connection health metrics
+
 
 4. **High memory usage**
-   - Check metrics for error accumulation
    - Verify file cleanup is working
    - Monitor thread pool usage
    - Check cache size and cleanup
 
 5. **Event processing delays**
-   - Check queue size in metrics
    - Verify thread pool is not saturated
-   - Monitor average processing time
+   - Check system resources
 
 ### Logging
 
@@ -281,13 +248,12 @@ The app provides detailed logging at different levels:
 - `INFO`: Normal operation messages
 - `WARNING`: Configuration issues
 - `ERROR`: Operation failures
-- `METRICS`: Performance statistics
+
 
 ### Performance Tuning
 
 - **Thread Pool Size**: Default is 3 workers, adjust based on system resources
-- **Retry Strategy**: Exponential backoff with jitter reduces server load during outages
-- **Circuit Breaker**: Automatically prevents cascade failures (5 failures trigger open state)
+- **Retry Strategy**: Simple exponential backoff reduces server load during outages
 - **File Retention**: Adjust `max_file_age_days` based on storage capacity
 - **Cache TTL**: Adjust `cache_ttl_hours` based on usage patterns
 - **Cooldown Periods**: Balance between responsiveness and notification spam
