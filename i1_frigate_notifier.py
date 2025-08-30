@@ -5,8 +5,9 @@ Copyright (c) 2025 the_louie
 All rights reserved.
 
 This app listens to Frigate MQTT events and sends notifications to configured users
-when motion is detected. It supports zone filtering, cooldown periods, and video clip
-downloads.
+when motion is detected. It supports zone filtering, cooldown periods, and snapshot
+image downloads. Notifications include image attachments and action links to view
+the corresponding video clips.
 
 Configuration:
   frigate_notify:
@@ -129,9 +130,7 @@ class FrigateNotification(hass.Hass):
         # Load today's metrics on startup
         self._load_todays_metrics()
 
-        # Event tracking for early notification
-        self.tracked_events = {}  # event_id -> {start_time, last_check, handled}
-        self.event_tracking_lock = threading.Lock()
+
 
         self._load_config()
         self._setup_mqtt()
@@ -143,15 +142,11 @@ class FrigateNotification(hass.Hass):
         self.processing_thread = threading.Thread(target=self._event_processing_worker, name="EventProcessor", daemon=True)
         self.processing_thread.start()
 
-        # Start event tracking thread for early clip checking
-        self.event_tracking_thread = threading.Thread(target=self._event_tracking_worker, name="EventTracker", daemon=True)
-        self.event_tracking_thread.start()
-
         # Schedule periodic tasks
         self.run_every(self._cleanup_old_files, datetime.now(), 24 * 60 * 60)
         self.run_every(self._log_daily_metrics, datetime.now().replace(hour=23, minute=59, second=0, microsecond=0), 24 * 60 * 60)
         self.run_every(self._cleanup_cache, datetime.now(), 6 * 60 * 60)
-        self.run_every(self._cleanup_old_tracked_events, datetime.now(), 5 * 60)  # Every 5 minutes
+        self.run_every(self._cleanup_notified_events, datetime.now(), 60 * 60)  # Every hour
 
     def _load_config(self) -> None:
         """Load and validate configuration from args."""
@@ -237,109 +232,7 @@ class FrigateNotification(hass.Hass):
             except Exception as e:
                 self.log(f"ERROR: Event processing worker error: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
-    def _event_tracking_worker(self) -> None:
-        """Worker thread for tracking event ages and checking for early clip availability."""
-        while not self.shutdown_event.is_set():
-            try:
-                current_time = time.time()
-                events_to_check = []
 
-                # Get events that need checking
-                with self.event_tracking_lock:
-                    tracked_count = len(self.tracked_events)
-                    for event_id, event_data in self.tracked_events.items():
-                        if event_data["handled"]:
-                            continue
-
-                        age = current_time - event_data["start_time"]
-                        if age >= 35 and (current_time - event_data["last_check"]) >= 5:
-                            # Make a copy of event data to avoid race conditions
-                            event_copy = {
-                                "start_time": event_data["start_time"],
-                                "camera": event_data["camera"],
-                                "label": event_data["label"],
-                                "entered_zones": event_data["entered_zones"].copy() if event_data["entered_zones"] else []
-                            }
-                            events_to_check.append((event_id, event_copy))
-                            event_data["last_check"] = current_time
-
-                # Log tracking status periodically
-                if tracked_count > 0 and len(events_to_check) > 0:
-                    self.log(f"DEBUG: Tracking {tracked_count} events, checking {len(events_to_check)} for clip availability")
-
-                # Check each event for clip availability
-                for event_id, event_data in events_to_check:
-                    self._check_event_clip_availability(event_id, event_data)
-
-                time.sleep(1)  # Check every second
-
-            except Exception as e:
-                self.log(f"ERROR: Event tracking worker error: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
-
-    def _check_event_clip_availability(self, event_id: str, event_data: Dict[str, Any]) -> None:
-        """Check if a clip.mp4 is available for an event and trigger notification if so."""
-        event_suffix = event_id.split('-')[-1] if '-' in event_id else event_id
-        age = time.time() - event_data["start_time"]
-
-        # Prevent events from running indefinitely (max 10 minutes)
-        if age > 600:  # 10 minutes
-            self.log(f"DEBUG[{event_suffix}]: Event too old ({age:.1f}s), marking as handled to prevent infinite processing")
-            with self.event_tracking_lock:
-                if event_id in self.tracked_events:
-                    self.tracked_events[event_id]["handled"] = True
-            return
-
-        self.log(f"DEBUG[{event_suffix}]: Checking clip availability for event (age: {age:.1f}s)")
-
-        # Check for potential recipients before attempting media download
-        event_data_for_check = {
-            "event_id": event_id,
-            "camera": event_data["camera"],
-            "label": event_data["label"],
-            "entered_zones": event_data["entered_zones"],
-            "event_type": "end",
-            "timestamp": datetime.fromtimestamp(event_data["start_time"])
-        }
-
-        if not self._check_potential_recipients(event_data_for_check, event_suffix):
-            self.log(f"DEBUG[{event_suffix}]: No potential recipients found, marking event as handled and skipping clip check")
-            self.log(f"DEBUG[{event_suffix}]: Event state - No recipients, skipping media download")
-            # Mark as handled immediately to avoid further processing
-            with self.event_tracking_lock:
-                if event_id in self.tracked_events:
-                    self.tracked_events[event_id]["handled"] = True
-            return
-
-        try:
-            # Try to download the clip with a single attempt
-            media_path = self._download_media(event_id, event_data["camera"], "clip.mp4", ".mp4", event_suffix)
-
-            if media_path:
-                self.log(f"DEBUG[{event_suffix}]: Clip available! Triggering early notification")
-
-                # Mark as handled
-                with self.event_tracking_lock:
-                    if event_id in self.tracked_events:
-                        self.tracked_events[event_id]["handled"] = True
-
-                # Create event data and send notification
-                event_data_for_notification = {
-                    "event_id": event_id,
-                    "camera": event_data["camera"],
-                    "label": event_data["label"],
-                    "entered_zones": event_data["entered_zones"],
-                    "event_type": "end",
-                    "timestamp": datetime.fromtimestamp(event_data["start_time"])
-                }
-
-                # Send notification with video
-                self._send_notifications(event_data_for_notification, media_path, "video", event_suffix)
-
-            else:
-                self.log(f"DEBUG[{event_suffix}]: Clip not yet available, will check again in 5s")
-
-        except Exception as e:
-            self.log(f"ERROR: Failed to check clip availability for event {event_id}: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
     def _handle_mqtt_message(self, event_name: str, data: Dict[str, Any], kwargs: Dict[str, Any]) -> None:
         """Handle incoming MQTT messages from Frigate."""
@@ -370,59 +263,16 @@ class FrigateNotification(hass.Hass):
 
             self.log(f"DEBUG[{event_suffix}]: MQTT event received - Topic: {topic}, Event ID: {event_id}, Type: {event_type}")
 
-            # Track all events for age monitoring
-            with self.event_tracking_lock:
-                if event_id not in self.tracked_events:
-                    # New event - start tracking
-                    self.tracked_events[event_id] = {
-                        "start_time": time.time(),
-                        "last_check": 0,
-                        "handled": False,
-                        "camera": event_data["camera"],
-                        "label": event_data["label"],
-                        "entered_zones": event_data["entered_zones"]
-                    }
-                    self.log(f"DEBUG[{event_suffix}]: Started tracking event (type: {event_type})")
-                elif event_type == "new":
-                    # Only reset tracking for actual new events, not updates
-                    self.tracked_events[event_id].update({
-                        "start_time": time.time(),
-                        "last_check": 0,
-                        "handled": False,
-                        "camera": event_data["camera"],
-                        "label": event_data["label"],
-                        "entered_zones": event_data["entered_zones"]
-                    })
-                    self.log(f"DEBUG[{event_suffix}]: Reset tracking for new event (type: {event_type})")
-                else:
-                    # Update existing event data without resetting tracking
-                    self.tracked_events[event_id].update({
-                        "camera": event_data["camera"],
-                        "label": event_data["label"],
-                        "entered_zones": event_data["entered_zones"]
-                    })
-
-                # Check if event is already handled
-                if self.tracked_events[event_id]["handled"]:
-                    self.log(f"DEBUG[{event_suffix}]: Event already handled, skipping")
-                    return
-
-            # For end events, check for potential recipients immediately
+            # Only process end events
             if event_type == "end":
                 self.log(f"DEBUG[{event_suffix}]: End event received, checking for potential recipients")
 
                 # Check if there are any potential recipients before processing
                 if not self._check_potential_recipients(event_data, event_suffix):
-                    self.log(f"DEBUG[{event_suffix}]: No potential recipients found, marking event as handled and skipping")
-                    # Mark as handled immediately to avoid further processing
-                    with self.event_tracking_lock:
-                        self.tracked_events[event_id]["handled"] = True
+                    self.log(f"DEBUG[{event_suffix}]: No potential recipients found, skipping event")
                     return
 
                 self.log(f"DEBUG[{event_suffix}]: Potential recipients found, proceeding with media download")
-                # Mark as handled
-                with self.event_tracking_lock:
-                    self.tracked_events[event_id]["handled"] = True
 
                 # Add to queue for processing
                 with self.queue_lock:
@@ -527,32 +377,24 @@ class FrigateNotification(hass.Hass):
             self.log(f"ERROR: Failed to process event: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
     def _download_and_notify(self, event_data: Dict[str, Any]) -> None:
-        """Download media and send notifications."""
+        """Download snapshot image and send notifications."""
         event_id = event_data["event_id"]
         event_suffix = event_id.split('-')[-1] if '-' in event_id else event_id
 
         try:
-            self.log(f"DEBUG[{event_suffix}]: Starting media download and notification process")
+            self.log(f"DEBUG[{event_suffix}]: Starting image download and notification process")
             self.log(f"DEBUG[{event_suffix}]: Event details - Camera: {event_data['camera']}, Label: {event_data['label']}, Zones: {event_data['entered_zones']}")
 
-            # Try video first with 30s timeout and 3s retries
-            self.log(f"DEBUG[{event_suffix}]: Attempting video download (clip.mp4)")
-            media_path = self._download_media_with_retry(event_data["event_id"], event_data["camera"], "clip.mp4", ".mp4", 30, 3, event_suffix)
-            if media_path:
-                self.log(f"DEBUG[{event_suffix}]: Video download successful: {media_path}")
-                self._send_notifications(event_data, media_path, "video", event_suffix)
-                return
-
-            # If video fails, try snapshot with 15s timeout and 2s retries
-            self.log(f"DEBUG[{event_suffix}]: Video failed, attempting snapshot download (snapshot.jpg)")
+            # Try snapshot with 15s timeout and 2s retries
+            self.log(f"DEBUG[{event_suffix}]: Attempting snapshot download (snapshot.jpg)")
             media_path = self._download_media_with_retry(event_data["event_id"], event_data["camera"], "snapshot.jpg", ".jpg", 15, 2, event_suffix)
             if media_path:
                 self.log(f"DEBUG[{event_suffix}]: Snapshot download successful: {media_path}")
                 self._send_notifications(event_data, media_path, "image", event_suffix)
                 return
 
-            # Send notification without media if both downloads failed
-            self.log(f"DEBUG[{event_suffix}]: Both video and snapshot downloads failed, sending notification without media")
+            # Send notification without media if snapshot download failed
+            self.log(f"DEBUG[{event_suffix}]: Snapshot download failed, sending notification without media")
             self.log(f"DEBUG[{event_suffix}]: Final state - No media available for notification")
             self._send_notifications(event_data, None, None, event_suffix)
 
@@ -623,6 +465,10 @@ class FrigateNotification(hass.Hass):
 
     def _download_media(self, event_id: str, camera: str, endpoint: str, extension: str, event_suffix: str) -> Optional[str]:
         """Download media file from Frigate."""
+        if not self.snapshot_dir:
+            self.log(f"ERROR[{event_suffix}]: No snapshot directory configured, cannot download {endpoint}")
+            return None
+            
         cache_key = f"{event_id}_{camera}_{endpoint}"
 
         self.log(f"DEBUG[{event_suffix}]: Checking cache for {endpoint} (key: {cache_key})")
@@ -693,9 +539,7 @@ class FrigateNotification(hass.Hass):
 
                 # Check content type to ensure we got the right file type
                 content_type = response.headers.get('Content-Type', '')
-                if endpoint == "clip.mp4" and not content_type.startswith('video/'):
-                    self.log(f"WARNING[{event_suffix}]: clip.mp4 has unexpected content type: {content_type}")
-                elif endpoint == "snapshot.jpg" and not content_type.startswith('image/'):
+                if endpoint == "snapshot.jpg" and not content_type.startswith('image/'):
                     self.log(f"WARNING[{event_suffix}]: snapshot.jpg has unexpected content type: {content_type}")
 
                 content = response.read()
@@ -706,27 +550,16 @@ class FrigateNotification(hass.Hass):
                 if file_size == 0:
                     self.log(f"ERROR[{event_suffix}]: {endpoint} file is empty (0 bytes) - treating as failed download")
                     self.log(f"DEBUG[{event_suffix}]: File state - Empty file detected, download failed")
-                    raise ValueError(f"File is empty: 0 bytes")
+                    raise ValueError("File is empty: 0 bytes")
 
-                # Check for empty or too small files based on file type
-                if endpoint == "clip.mp4":
-                    # For video files, use a more lenient threshold (500KB) and log warning for small files
-                    min_size = 500000  # 500KB
-                    if file_size < min_size:
-                        self.log(f"WARNING[{event_suffix}]: clip.mp4 file smaller than expected ({file_size} bytes) but accepting it (minimum: {min_size} bytes)")
-                        self.log(f"DEBUG[{event_suffix}]: File state - Small video file accepted (size: {file_size} bytes)")
-                        # Don't raise exception for small video files, just log warning
-                    else:
-                        self.log(f"DEBUG[{event_suffix}]: File state - Video file size acceptable (size: {file_size} bytes)")
+                # Check for too small image files
+                min_size = 50000  # 50KB
+                if file_size < min_size:
+                    self.log(f"ERROR[{event_suffix}]: {endpoint} file too small ({file_size} bytes) - treating as failed download (minimum: {min_size} bytes)")
+                    self.log(f"DEBUG[{event_suffix}]: File state - Image file too small, download failed")
+                    raise ValueError(f"File too small: {file_size} bytes (minimum: {min_size} bytes)")
                 else:
-                    # For image files, use strict validation
-                    min_size = 50000  # 50KB
-                    if file_size < min_size:
-                        self.log(f"ERROR[{event_suffix}]: {endpoint} file too small ({file_size} bytes) - treating as failed download (minimum: {min_size} bytes)")
-                        self.log(f"DEBUG[{event_suffix}]: File state - Image file too small, download failed")
-                        raise ValueError(f"File too small: {file_size} bytes (minimum: {min_size} bytes)")
-                    else:
-                        self.log(f"DEBUG[{event_suffix}]: File state - Image file size acceptable (size: {file_size} bytes)")
+                    self.log(f"DEBUG[{event_suffix}]: File state - Image file size acceptable (size: {file_size} bytes)")
 
                 with open(target_path, 'wb') as f:
                     f.write(content)
@@ -784,12 +617,14 @@ class FrigateNotification(hass.Hass):
 
         # Build notification data once
         camera_uri = f"homeassistant://navigate/dashboard-kameror/{camera}"
+        video_uri = f"{self.ext_domain}/api/frigate/frigate/notifications/{event_id}/clip.mp4"
         channel = f"frigate-{camera}"
 
-
-
         notification_data = {
-            "actions": [{"action": "URI", "title": "Open Camera", "uri": camera_uri}],
+            "actions": [
+                {"action": "URI", "title": "Open Camera", "uri": camera_uri},
+                {"action": "URI", "title": "Video", "uri": video_uri}
+            ],
             "channel": channel,
             "importance": "high",
             "visibility": "public",
@@ -801,23 +636,18 @@ class FrigateNotification(hass.Hass):
             "confirmation": True
         }
 
-        # Add media to notification
-        if media_path and self.ext_domain:
+        # Add media to notification (image only now)
+        if media_path and self.ext_domain and media_type == "image":
             # Fix double slash issue by ensuring proper path construction
             if media_path.startswith('/'):
                 media_path = media_path[1:]  # Remove leading slash
             media_url = f"{self.ext_domain}/local/frigate/{media_path}"
-            if media_type == "video":
-                notification_data["video"] = media_url
-                self.log(f"DEBUG[{event_suffix}]: Added video to notification: {media_url}")
-                self.log(f"DEBUG[{event_suffix}]: Notification state - Video media attached")
-            elif media_type == "image":
-                notification_data["image"] = media_url
-                self.log(f"DEBUG[{event_suffix}]: Added image to notification: {media_url}")
-                self.log(f"DEBUG[{event_suffix}]: Notification state - Image media attached")
+            notification_data["image"] = media_url
+            self.log(f"DEBUG[{event_suffix}]: Added image to notification: {media_url}")
+            self.log(f"DEBUG[{event_suffix}]: Notification state - Image media attached")
         else:
-            self.log(f"DEBUG[{event_suffix}]: No media attached to notification (media_path: {media_path}, ext_domain: {self.ext_domain})")
-            self.log(f"DEBUG[{event_suffix}]: Notification state - No media attached")
+            self.log(f"DEBUG[{event_suffix}]: No image attached to notification (media_path: {media_path}, media_type: {media_type}, ext_domain: {self.ext_domain})")
+            self.log(f"DEBUG[{event_suffix}]: Notification state - No image attached")
 
 
 
@@ -895,8 +725,7 @@ class FrigateNotification(hass.Hass):
                         "max_delivery_seconds": delivery_stats["max"]
                     })
 
-                # Prepare today's metrics
-                today_metrics = {"date": datetime.now().strftime("%Y-%m-%d"), **stats}
+
 
                 # Add comparison if yesterday's data exists
                 yesterday_metrics = self._load_yesterday_metrics()
@@ -916,8 +745,7 @@ class FrigateNotification(hass.Hass):
                             "max_delivery_diff": round(stats["max_delivery_seconds"] - yesterday_metrics["max_delivery_seconds"], 3)
                         })
 
-                    if comparison:
-                        today_metrics["comparison"] = comparison
+
 
                 # Log metrics (data is already saved continuously)
 
@@ -1077,7 +905,7 @@ class FrigateNotification(hass.Hass):
 
 
     def _cleanup_old_files(self, **kwargs) -> None:
-        """Clean up old video files to prevent disk space issues."""
+        """Clean up old image files to prevent disk space issues."""
         if not self.snapshot_dir or not self.snapshot_dir.exists():
             return
 
@@ -1085,13 +913,14 @@ class FrigateNotification(hass.Hass):
             cutoff_time = datetime.now() - timedelta(days=self.max_file_age_days)
             files_removed = 0
 
-            for file_path in self.snapshot_dir.rglob("*.mp4"):
+            # Clean up image files
+            for file_path in self.snapshot_dir.rglob("*.jpg"):
                 if file_path.stat().st_mtime < cutoff_time.timestamp():
                     file_path.unlink()
                     files_removed += 1
 
             if files_removed > 0:
-                self.log(f"Cleaned up {files_removed} old video files")
+                self.log(f"Cleaned up {files_removed} old image files")
 
         except Exception as e:
             self.log(f"ERROR: Failed to cleanup old files: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
@@ -1121,36 +950,16 @@ class FrigateNotification(hass.Hass):
         except Exception as e:
             self.log(f"ERROR: Failed to cleanup cache: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
-    def _cleanup_old_tracked_events(self, **kwargs) -> None:
-        """Clean up old tracked events to prevent memory leaks."""
+    def _cleanup_notified_events(self, **kwargs) -> None:
+        """Clean up notified events set to prevent memory leaks."""
         try:
-            current_time = time.time()
-            cutoff_time = current_time - 300  # Remove events older than 5 minutes
-
-            with self.event_tracking_lock:
-                events_to_remove = []
-                for event_id, event_data in self.tracked_events.items():
-                    # Remove events that are too old or have been handled for too long
-                    if event_data["start_time"] < cutoff_time:
-                        events_to_remove.append(event_id)
-                    elif event_data["handled"] and (current_time - event_data.get("last_check", 0)) > 60:
-                        # Remove handled events that haven't been checked recently
-                        events_to_remove.append(event_id)
-
-                for event_id in events_to_remove:
-                    del self.tracked_events[event_id]
-
-                if events_to_remove:
-                    self.log(f"Cleaned up {len(events_to_remove)} old tracked events")
-
-                # Also clean up notified events set to prevent memory leaks
+            with self.notification_lock:
                 if len(self.notified_events) > 1000:
                     # Keep only the most recent 500 events
                     self.notified_events.clear()
                     self.log("Cleaned up notified events set to prevent memory leaks")
-
         except Exception as e:
-            self.log(f"ERROR: Failed to cleanup tracked events: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
+            self.log(f"ERROR: Failed to cleanup notified events: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
     def terminate(self) -> None:
         """Cleanup when app is terminated."""
@@ -1160,9 +969,6 @@ class FrigateNotification(hass.Hass):
 
         if self.processing_thread and self.processing_thread.is_alive():
             self.processing_thread.join(timeout=5)
-
-        if hasattr(self, 'event_tracking_thread') and self.event_tracking_thread.is_alive():
-            self.event_tracking_thread.join(timeout=5)
 
         if hasattr(self, 'executor'):
             self.executor.shutdown(wait=True)
