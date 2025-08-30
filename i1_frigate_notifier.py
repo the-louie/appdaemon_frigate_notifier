@@ -275,19 +275,11 @@ class FrigateNotification(hass.Hass):
 
     def _handle_tracked_object_update(self, payload: Dict[str, Any]) -> None:
         """Handle frigate/tracked_object_update messages for face recognition updates."""
-        if not self.face_detection_enabled:
+        if not self.face_detection_enabled or payload.get("type") != "face":
             return
 
-        update_type = payload.get("type")
-        if update_type == "face":
-            # Face recognition update - could be used for real-time updates
-            # For now, we'll just log it since we process face data from the main events
-            event_id = payload.get("id", "unknown")
-            face_name = payload.get("name", "unknown")
-            confidence = payload.get("score", 0.0)
-
-            if confidence >= self.face_detection_threshold:
-                self.log(f"Face recognition update: {face_name} (confidence: {confidence:.2f}) - Event ID: {event_id}")
+        # Face recognition updates are handled in main events - minimal processing here
+        # Could be extended for real-time face updates if needed
 
     def _handle_notification_received(self, event_name: str, data: Dict[str, Any], kwargs: Dict[str, Any]) -> None:
         """Handle mobile app notification received events to track delivery times."""
@@ -355,7 +347,7 @@ class FrigateNotification(hass.Hass):
                 if (isinstance(face_name, str) and isinstance(confidence, (int, float)) and
                     confidence >= self.face_detection_threshold):
                     face_detected = face_name.strip()
-                    face_confidence = float(confidence)
+                    face_confidence = confidence
 
             return {
                 "event_id": event_id,
@@ -426,9 +418,11 @@ class FrigateNotification(hass.Hass):
         # Check user enabled, label match, camera match, and zone match
         # Use both entered_zones and current_zones for more accurate zone matching
         user_zones = config.get("zones")
-        zone_match = (not user_zones or
-                     any(zone in user_zones for zone in entered_zones) or
-                     any(zone in user_zones for zone in current_zones))
+        if user_zones:
+            all_zones = set(entered_zones) | set(current_zones)
+            zone_match = bool(user_zones & all_zones)
+        else:
+            zone_match = True
 
         if (not config["enabled"] or
             label not in config["labels"] or
@@ -757,7 +751,8 @@ class FrigateNotification(hass.Hass):
             notifications_sent += 1
 
             # Include face confidence in logging if available
-            face_confidence_info = f" (confidence: {event_data.get('face_confidence', 0):.2f})" if face_detected else ""
+            face_confidence = event_data.get('face_confidence')
+            face_confidence_info = f" (confidence: {face_confidence:.2f})" if face_detected and face_confidence else ""
             self.log(f"Notification sent to {config['name']} - {title} - Event ID: {event_id}{media_info}{face_info}{face_confidence_info}")
 
         # Record metrics and log completion
