@@ -81,20 +81,6 @@ class FrigateNotification(hass.Hass):
 
         return result
 
-    def _extract_metrics_from_entry(self, entry: Dict[str, Any], metric_type: str) -> Dict[str, Any]:
-        """Extract metrics from entry in either old or new format."""
-        key = f"{metric_type}_times"
-        if key not in entry:
-            return {}
-
-        data = entry[key]
-        if isinstance(data, dict):
-            # New format with calculated stats
-            return {k: v for k, v in data.items() if not k == "raw"}
-
-        # Old format - calculate stats from raw times
-        return self._create_metrics_dict(data, metric_type)
-
     def initialize(self) -> None:
         """Initialize the Frigate notification app.
 
@@ -120,7 +106,7 @@ class FrigateNotification(hass.Hass):
         # Notification tracking to prevent duplicates
         self.notified_events = set()  # Track events that have already been notified
         self.notification_lock = threading.Lock()
-        
+
         # Circuit breaker for download failures
         # Circuit breaker state: endpoint -> {"failures": count, "last_failure": timestamp, "state": "closed"|"open"|"half_open"}
         self.circuit_breaker_state = {}
@@ -393,7 +379,7 @@ class FrigateNotification(hass.Hass):
         try:
             # Try to download snapshot image with intelligent retry
             media_path = self._download_media_with_retry(
-                event_data["event_id"], event_data["camera"], "snapshot.jpg", ".jpg", 15, 1, event_suffix
+                event_data["event_id"], event_data["camera"], "snapshot.jpg", ".jpg", 15, event_suffix
             )
             if media_path:
                 self._send_notifications(event_data, media_path, "image", event_suffix)
@@ -453,15 +439,15 @@ class FrigateNotification(hass.Hass):
         with self.circuit_breaker_lock:
             if circuit_key not in self.circuit_breaker_state:
                 return True
-                
+
             state_info = self.circuit_breaker_state[circuit_key]
             current_time = time.time()
-            
+
             # Circuit breaker states:
             # - closed: normal operation
             # - open: blocking requests due to failures
             # - half_open: allowing single test request
-            
+
             if state_info["state"] == "closed":
                 return True
             elif state_info["state"] == "open":
@@ -471,10 +457,12 @@ class FrigateNotification(hass.Hass):
                     return True
                 return False
             elif state_info["state"] == "half_open":
+                # Only allow one request in half-open state
+                state_info["state"] = "open"  # Block further requests until success/failure
                 return True
-                
+
         return True
-    
+
     def _record_circuit_failure(self, circuit_key: str) -> None:
         """Record a failure for circuit breaker tracking."""
         with self.circuit_breaker_lock:
@@ -484,16 +472,16 @@ class FrigateNotification(hass.Hass):
                     "last_failure": 0,
                     "state": "closed"
                 }
-                
+
             state_info = self.circuit_breaker_state[circuit_key]
             state_info["failures"] += 1
             state_info["last_failure"] = time.time()
-            
+
             # Open circuit if too many failures (5 failures triggers open state)
             if state_info["failures"] >= 5:
                 state_info["state"] = "open"
                 self.log(f"Circuit breaker OPENED for {circuit_key} due to {state_info['failures']} failures")
-    
+
     def _reset_circuit_breaker(self, circuit_key: str) -> None:
         """Reset circuit breaker after successful operation."""
         with self.circuit_breaker_lock:
@@ -503,40 +491,40 @@ class FrigateNotification(hass.Hass):
                     "last_failure": 0,
                     "state": "closed"
                 }
-    
+
     def _is_retryable_error(self, error: Exception) -> bool:
         """Determine if an error is retryable based on error type and message."""
         error_str = str(error).lower()
         error_type = type(error).__name__
-        
+
         # Network-related errors that are typically retryable
         retryable_errors = {
             "TimeoutError", "ConnectionError", "URLError", "HTTPError"
         }
-        
+
         # HTTP status codes that are retryable
         retryable_http_statuses = {500, 502, 503, 504, 429}  # Server errors and rate limiting
-        
+
         # Check for specific retryable conditions
         if error_type in retryable_errors:
             return True
-            
+
         # Check for HTTP status codes in error message
         for status in retryable_http_statuses:
             if f"http error {status}" in error_str:
                 return True
-                
+
         # Check for common retryable error messages
         retryable_messages = [
             "timeout", "connection", "network", "temporary", "server error",
             "service unavailable", "bad gateway", "gateway timeout"
         ]
-        
+
         return any(msg in error_str for msg in retryable_messages)
 
-    def _download_media_with_retry(
+        def _download_media_with_retry(
         self, event_id: str, camera: str, endpoint: str, extension: str,
-        max_timeout: int, base_delay: int, event_suffix: str
+        max_timeout: int, event_suffix: str
     ) -> Optional[str]:
         """Download media with exponential backoff, jitter, and circuit breaker.
         
@@ -546,49 +534,51 @@ class FrigateNotification(hass.Hass):
             endpoint: API endpoint (e.g., 'snapshot.jpg')
             extension: File extension
             max_timeout: Maximum total time to spend on retries
-            base_delay: Base delay for exponential backoff (ignored, kept for compatibility)
             event_suffix: Event suffix for logging
             
         Returns:
             Path to downloaded media file or None if failed
         """
         circuit_key = f"{camera}_{endpoint}"
-        
+
         # Check circuit breaker state
         if not self._is_circuit_closed(circuit_key):
             self.log(f"Circuit breaker OPEN for {circuit_key}, skipping download")
             return None
-            
+
         start_time = time.time()
         attempt = 0
         max_attempts = 5  # Maximum number of retry attempts
 
         while time.time() - start_time < max_timeout and attempt < max_attempts:
             attempt += 1
-            
+
             try:
                 media_path = self._download_media(event_id, camera, endpoint, extension, event_suffix)
                 if media_path:
                     # Success - reset circuit breaker
                     self._reset_circuit_breaker(circuit_key)
                     return media_path
+                else:
+                    # No exception but no media path - record as failure
+                    self._record_circuit_failure(circuit_key)
                     
             except Exception as e:
                 line_num = sys.exc_info()[2].tb_lineno
                 error_type = type(e).__name__
-                
+
                 # Determine if error is retryable
                 is_retryable = self._is_retryable_error(e)
-                
+
                 self.log(
                     f"ERROR: Media download attempt {attempt} failed for {event_id} ({error_type}): "
                     f"{e} (line {line_num})",
                     level="ERROR"
                 )
-                
+
                 # Record failure for circuit breaker
                 self._record_circuit_failure(circuit_key)
-                
+
                 # If not retryable or max attempts reached, exit early
                 if not is_retryable or attempt >= max_attempts:
                     break
@@ -596,14 +586,12 @@ class FrigateNotification(hass.Hass):
             # Calculate exponential backoff with jitter if more attempts allowed
             if attempt < max_attempts and time.time() - start_time < max_timeout:
                 # Exponential backoff: 1s, 2s, 4s, 8s
-                base_delay_exp = min(2 ** (attempt - 1), 8)  # Cap at 8 seconds
+                base_delay_exp = min(2 ** attempt, 8)  # Correct exponential calculation
                 # Add jitter: ±25% of base delay
                 jitter = random.uniform(-0.25, 0.25) * base_delay_exp
                 delay = max(0.1, base_delay_exp + jitter)  # Minimum 0.1s delay
-                
-                self.log(f"Retrying {endpoint} download in {delay:.2f}s (attempt {attempt + 1})")
                 time.sleep(delay)
-                
+
         return None
 
     def _download_media(
@@ -778,9 +766,6 @@ class FrigateNotification(hass.Hass):
     def _log_daily_metrics(self, **kwargs) -> None:
         """Log daily notification performance metrics and enrich previous day's data."""
         try:
-            # First, enrich yesterday's data with calculated statistics
-            self._enrich_yesterdays_metrics()
-
             with self.metrics_lock:
                 if not self.notification_times and not self.delivery_times:
                     self.log("METRICS: No notifications sent today")
@@ -805,29 +790,7 @@ class FrigateNotification(hass.Hass):
                         "max_delivery_seconds": delivery_stats.get("max_delivery_seconds", 0)
                     })
 
-                # Add comparison if yesterday's data exists
-                yesterday_metrics = self._load_yesterday_metrics()
-                comparison = {}
-                if yesterday_metrics:
-                    if "min_seconds" in stats and "min_seconds" in yesterday_metrics:
-                        comparison.update({
-                            "min_diff": round(stats["min_seconds"] - yesterday_metrics["min_seconds"], 3),
-                            "avg_diff": round(stats["avg_seconds"] - yesterday_metrics["avg_seconds"], 3),
-                            "max_diff": round(stats["max_seconds"] - yesterday_metrics["max_seconds"], 3)
-                        })
-
-                    if "min_delivery_seconds" in stats and "min_delivery_seconds" in yesterday_metrics:
-                        comparison.update({
-                            "min_delivery_diff": round(
-                                stats["min_delivery_seconds"] - yesterday_metrics["min_delivery_seconds"], 3
-                            ),
-                            "avg_delivery_diff": round(
-                                stats["avg_delivery_seconds"] - yesterday_metrics["avg_delivery_seconds"], 3
-                            ),
-                            "max_delivery_diff": round(
-                                stats["max_delivery_seconds"] - yesterday_metrics["max_delivery_seconds"], 3
-                            )
-                        })
+                # Log metrics without comparison (simplified)
 
                 # Log metrics (data is already saved continuously)
 
@@ -846,21 +809,7 @@ class FrigateNotification(hass.Hass):
                         f"Avg={stats['avg_delivery_seconds']}s, Max={stats['max_delivery_seconds']}s"
                     )
 
-                # Add comparison data if available
-                if comparison:
-                    comp_data = []
-                    if "min_diff" in comparison:
-                        comp_data.append(
-                            f"Min diff: {comparison['min_diff']:+0.3f}s, Avg diff: {comparison['avg_diff']:+0.3f}s, "
-                            f"Max diff: {comparison['max_diff']:+0.3f}s"
-                        )
-                    if "min_delivery_diff" in comparison:
-                        comp_data.append(
-                            f"Delivery diff: Min {comparison['min_delivery_diff']:+0.3f}s, "
-                            f"Avg {comparison['avg_delivery_diff']:+0.3f}s, Max {comparison['max_delivery_diff']:+0.3f}s"
-                        )
-                    if comp_data:
-                        log_components.extend(comp_data)
+                # Log current day metrics only
 
                 self.log(" | ".join(log_components))
 
@@ -1072,10 +1021,10 @@ class FrigateNotification(hass.Hass):
                     key for key, state in self.circuit_breaker_state.items()
                     if current_time - state["last_failure"] > 24 * 60 * 60
                 ]
-                
+
                 for key in keys_to_remove:
                     del self.circuit_breaker_state[key]
-                    
+
                 if keys_to_remove:
                     self.log(f"Cleaned up {len(keys_to_remove)} old circuit breaker states")
         except Exception as e:
