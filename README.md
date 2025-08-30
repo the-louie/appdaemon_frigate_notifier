@@ -161,10 +161,13 @@ frigate_notify:
 - Video downloads use a thread pool (5 workers) for concurrent processing
 - Non-blocking MQTT message handling
 
-### Media Download Logic
-- Video downloads with 30-second timeout and 2-second retries
-- Automatic fallback to snapshot images if video fails
-- Immediate notification sending when media is available
+### Intelligent Media Download Logic
+- **Exponential Backoff**: Retry delays increase exponentially (1s, 2s, 4s, 8s) with random jitter
+- **Circuit Breaker Pattern**: Prevents cascade failures by temporarily blocking requests after persistent failures
+- **Adaptive Retry Logic**: Different retry strategies based on error types (network vs server errors)
+- **Smart Error Classification**: Distinguishes between retryable and non-retryable errors
+- **Automatic Recovery**: Circuit breakers automatically test and recover from failure states
+- **Memory Efficient**: Automatic cleanup of old circuit breaker states
 
 ### File Management
 - Automatic cleanup of old video files
@@ -282,8 +285,9 @@ The app provides detailed logging at different levels:
 
 ### Performance Tuning
 
-- **Thread Pool Size**: Default is 5 workers, adjust based on system resources
-
+- **Thread Pool Size**: Default is 3 workers, adjust based on system resources
+- **Retry Strategy**: Exponential backoff with jitter reduces server load during outages
+- **Circuit Breaker**: Automatically prevents cascade failures (5 failures trigger open state)
 - **File Retention**: Adjust `max_file_age_days` based on storage capacity
 - **Cache TTL**: Adjust `cache_ttl_hours` based on usage patterns
 - **Cooldown Periods**: Balance between responsiveness and notification spam
