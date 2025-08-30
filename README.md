@@ -293,8 +293,9 @@ The app provides detailed logging at different levels:
 
 - AppDaemon 4.x
 - MQTT Plugin for AppDaemon
-- Python `requests` library
 - Frigate instance with MQTT enabled
+
+*No external Python libraries required - uses only standard library modules*
 
 ## License
 

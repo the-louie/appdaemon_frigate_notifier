@@ -38,7 +38,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import appdaemon.plugins.hass.hassapi as hass
 
@@ -46,55 +46,53 @@ import appdaemon.plugins.hass.hassapi as hass
 class FrigateNotification(hass.Hass):
     """AppDaemon app for sending Frigate motion notifications."""
 
+    def _calculate_stats(self, times: List[float]) -> Dict[str, float]:
+        """Calculate statistical metrics for a list of times."""
+        if not times:
+            return {}
+
+        mean = sum(times) / len(times)
+        std_dev = (sum((x - mean) ** 2 for x in times) / len(times)) ** 0.5 if len(times) >= 2 else 0.0
+
+        return {
+            "min": round(min(times), 3),
+            "avg": round(mean, 3),
+            "max": round(max(times), 3),
+            "std": round(std_dev, 3)
+        }
+
+    def _create_metrics_dict(self, times: List[float], metric_type: str, include_raw: bool = False) -> Dict[str, Any]:
+        """Create metrics dictionary with optional raw data."""
+        if not times:
+            return {}
+
+        stats = self._calculate_stats(times)
+        result = {
+            f"total_{metric_type}": len(times),
+            f"min_{metric_type}_seconds": stats["min"],
+            f"avg_{metric_type}_seconds": stats["avg"],
+            f"max_{metric_type}_seconds": stats["max"],
+            f"std_{metric_type}_seconds": stats["std"]
+        }
+
+        if include_raw:
+            result["raw"] = times
+
+        return result
+
     def _extract_metrics_from_entry(self, entry: Dict[str, Any], metric_type: str) -> Dict[str, Any]:
         """Extract metrics from entry in either old or new format."""
         key = f"{metric_type}_times"
         if key not in entry:
             return {}
 
-        if isinstance(entry[key], dict):
-            # New format with raw data and stats
-            return {
-                f"total_{metric_type}": entry[key].get(f"total_{metric_type}", 0),
-                f"min_{metric_type}_seconds": entry[key].get(f"min_{metric_type}_seconds", 0),
-                f"avg_{metric_type}_seconds": entry[key].get(f"avg_{metric_type}_seconds", 0),
-                f"max_{metric_type}_seconds": entry[key].get(f"max_{metric_type}_seconds", 0),
-                f"std_{metric_type}_seconds": entry[key].get(f"std_{metric_type}_seconds", 0)
-            }
+        data = entry[key]
+        if isinstance(data, dict):
+            # New format with calculated stats
+            return {k: v for k, v in data.items() if not k == "raw"}
 
-        # Old format - calculate stats inline
-        times = entry[key]
-        if not times:
-            return {}
-
-        mean = sum(times) / len(times)
-        std_dev = (sum((x - mean) ** 2 for x in times) / len(times)) ** 0.5 if len(times) >= 2 else 0.0
-
-        return {
-            f"total_{metric_type}": len(times),
-            f"min_{metric_type}_seconds": round(min(times), 3),
-            f"avg_{metric_type}_seconds": round(mean, 3),
-            f"max_{metric_type}_seconds": round(max(times), 3),
-            f"std_{metric_type}_seconds": round(std_dev, 3)
-        }
-
-    def _create_enriched_metrics(self, times: list, metric_type: str) -> Dict[str, Any]:
-        """Create enriched metrics structure with raw data and calculated statistics."""
-        if not times:
-            return {}
-
-        # Inline stats calculation for better performance
-        mean = sum(times) / len(times)
-        std_dev = (sum((x - mean) ** 2 for x in times) / len(times)) ** 0.5 if len(times) >= 2 else 0.0
-
-        return {
-            "raw": times,
-            f"total_{metric_type}": len(times),
-            f"min_{metric_type}_seconds": round(min(times), 3),
-            f"avg_{metric_type}_seconds": round(mean, 3),
-            f"max_{metric_type}_seconds": round(max(times), 3),
-            f"std_{metric_type}_seconds": round(std_dev, 3)
-        }
+        # Old format - calculate stats from raw times
+        return self._create_metrics_dict(data, metric_type)
 
     def initialize(self) -> None:
         """Initialize the Frigate notification app.
@@ -163,17 +161,12 @@ class FrigateNotification(hass.Hass):
             setattr(self, attr_name, value)
 
         # Load optional parameters with defaults
-        defaults = {
-            "mqtt_topic": "frigate/events",
-            "only_zones": False,
-            "cam_icons": {},
-            "max_file_age_days": 30,
-            "cache_ttl_hours": 24,
-            "connection_timeout": 30
-        }
-
-        for param_name, default_value in defaults.items():
-            setattr(self, param_name, self.args.get(param_name, default_value))
+        self.mqtt_topic = self.args.get("mqtt_topic", "frigate/events")
+        self.only_zones = self.args.get("only_zones", False)
+        self.cam_icons = self.args.get("cam_icons", {})
+        self.max_file_age_days = self.args.get("max_file_age_days", 30)
+        self.cache_ttl_hours = self.args.get("cache_ttl_hours", 24)
+        self.connection_timeout = self.args.get("connection_timeout", 30)
 
         # Setup snapshot directory
         snapshot_dir = self.args.get("snapshot_dir")
@@ -186,31 +179,31 @@ class FrigateNotification(hass.Hass):
         self._load_person_configs()
 
     def _load_person_configs(self) -> None:
-        """Load and validate person notification configurations.
-
-        Processes the 'persons' configuration list, validating required fields
-        and converting string lists to sets for efficient lookups.
-        """
+        """Load and validate person notification configurations."""
         for person_data in self.args.get("persons", []):
             try:
-                # Validate required fields
-                name, notify, labels = person_data.get("name"), person_data.get("notify"), person_data.get("labels", [])
-                if not all([name, notify, labels]):
+                # Early validation - check required fields first
+                name = person_data.get("name")
+                notify = person_data.get("notify")
+                labels = person_data.get("labels", [])
+
+                if not name or not notify or not labels:
+                    self.log(
+                        f"ERROR: Missing required fields for person config: name={name}, notify={notify}, labels={labels}",
+                        level="ERROR"
+                    )
                     continue
 
-                # Build config with defaults and validation
+                # Build config with validated data
                 config = {
                     "name": name,
                     "notify": notify,
                     "labels": set(labels),
-                    "cooldown": person_data.get("cooldown", 0),
-                    "enabled": person_data.get("enabled", True)
+                    "cooldown": max(0, person_data.get("cooldown", 0)),  # Ensure non-negative
+                    "enabled": person_data.get("enabled", True),
+                    "zones": set(person_data.get("zones", [])) if person_data.get("zones") else None,
+                    "cameras": set(person_data.get("cameras", [])) if person_data.get("cameras") else None
                 }
-
-                # Add optional sets if specified
-                for key in ["zones", "cameras"]:
-                    value = person_data.get(key)
-                    config[key] = set(value) if value else None
 
                 self.person_configs.append(config)
 
@@ -254,13 +247,11 @@ class FrigateNotification(hass.Hass):
     def _handle_mqtt_message(self, event_name: str, data: Dict[str, Any], kwargs: Dict[str, Any]) -> None:
         """Handle incoming MQTT messages from Frigate."""
         try:
-            # Early validation with combined checks
-            if (not data or
-                not all(key in data for key in ['topic', 'payload']) or
-                not data['topic'].startswith(self.mqtt_topic)):
+            # Early validation - exit immediately if invalid
+            if not data or 'topic' not in data or 'payload' not in data or not data['topic'].startswith(self.mqtt_topic):
                 return
 
-            # Parse payload if string
+            # Parse JSON payload
             payload = data['payload']
             if isinstance(payload, str):
                 try:
@@ -269,7 +260,7 @@ class FrigateNotification(hass.Hass):
                     self.log("ERROR: Invalid JSON payload", level="ERROR")
                     return
 
-            # Extract and validate event data
+            # Extract event data and validate it's an end event
             event_data = self._extract_event_data(payload)
             if not event_data or event_data["event_type"] != "end":
                 return
@@ -277,14 +268,11 @@ class FrigateNotification(hass.Hass):
             event_id = event_data["event_id"]
             event_suffix = event_id.split('-')[-1] if '-' in event_id else event_id
 
-            self.log(f"DEBUG[{event_suffix}]: End event received, checking for potential recipients")
-
-            # Check recipients before queueing
-            if not self._check_potential_recipients(event_data, event_suffix):
-                self.log(f"DEBUG[{event_suffix}]: No potential recipients found, skipping event")
+            # Early exit if no potential recipients
+            if not self._has_potential_recipients(event_data):
                 return
 
-            # Add to processing queue
+            # Queue event for processing
             with self.queue_lock:
                 if len(self.event_queue) < 1000:
                     self.event_queue.append(event_data)
@@ -293,7 +281,8 @@ class FrigateNotification(hass.Hass):
                     self.log(f"DEBUG[{event_suffix}]: Event queue full, dropping event")
 
         except Exception as e:
-            self.log(f"ERROR: Failed to process MQTT message: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
+            line_num = sys.exc_info()[2].tb_lineno
+            self.log(f"ERROR: Failed to process MQTT message: {e} (line {line_num})", level="ERROR")
 
     def _handle_notification_received(self, event_name: str, data: Dict[str, Any], kwargs: Dict[str, Any]) -> None:
         """Handle mobile app notification received events to track delivery times."""
@@ -395,52 +384,62 @@ class FrigateNotification(hass.Hass):
         event_suffix = event_id.split('-')[-1] if '-' in event_id else event_id
 
         try:
-            self.log(f"DEBUG[{event_suffix}]: Starting image download and notification process")
-            camera, label, zones = event_data['camera'], event_data['label'], event_data['entered_zones']
-            self.log(f"DEBUG[{event_suffix}]: Event details - Camera: {camera}, Label: {label}, Zones: {zones}")
-
-            # Try snapshot with 15s timeout and 2s retries
-            self.log(f"DEBUG[{event_suffix}]: Attempting snapshot download (snapshot.jpg)")
+            # Try to download snapshot image
             media_path = self._download_media_with_retry(
                 event_data["event_id"], event_data["camera"], "snapshot.jpg", ".jpg", 15, 2, event_suffix
             )
             if media_path:
-                self.log(f"DEBUG[{event_suffix}]: Snapshot download successful: {media_path}")
                 self._send_notifications(event_data, media_path, "image", event_suffix)
                 return
 
             # Send notification without media if snapshot download failed
-            self.log(f"DEBUG[{event_suffix}]: Snapshot download failed, sending notification without media")
-            self.log(f"DEBUG[{event_suffix}]: Final state - No media available for notification")
             self._send_notifications(event_data, None, None, event_suffix)
 
         except Exception as e:
             line_num = sys.exc_info()[2].tb_lineno
             self.log(f"ERROR: Failed to download and notify for event {event_id}: {e} (line {line_num})", level="ERROR")
-            self.log(f"DEBUG[{event_suffix}]: Exception state - Media download process failed completely")
 
-    def _check_potential_recipients(self, event_data: Dict[str, Any], event_suffix: str) -> bool:
-        """Check if there are any potential recipients for this event."""
+    def _has_potential_recipients(self, event_data: Dict[str, Any]) -> bool:
+        """Check if any user would receive notifications for this event."""
         if not self.person_configs:
             return False
 
-        camera, label, entered_zones = event_data["camera"], event_data["label"], event_data["entered_zones"]
+        camera = event_data["camera"]
+        label = event_data["label"]
+        entered_zones = event_data["entered_zones"]
         current_time = time.time()
 
-        for person_config in self.person_configs:
-            # Check all filters in one go
-            if (not person_config["enabled"] or
-                label not in person_config["labels"] or
-                (person_config["cameras"] and camera not in person_config["cameras"]) or
-                (person_config["zones"] and not any(zone in person_config["zones"] for zone in entered_zones))):
+        for config in self.person_configs:
+            # Skip if user disabled, wrong label, camera, or zone
+            if (not config["enabled"] or
+                label not in config["labels"] or
+                (config["cameras"] and camera not in config["cameras"]) or
+                (config["zones"] and not any(zone in config["zones"] for zone in entered_zones))):
                 continue
 
-            # Check cooldown
-            cooldown_key = f"{person_config['notify']}/{camera}"
-            if current_time - self.msg_cooldown.get(cooldown_key, 0) >= person_config["cooldown"]:
+            # Check cooldown period
+            cooldown_key = f"{config['notify']}/{camera}"
+            if current_time - self.msg_cooldown.get(cooldown_key, 0) >= config["cooldown"]:
                 return True
 
         return False
+
+    def _should_notify_user(self, config: Dict[str, Any], event_data: Dict[str, Any], current_time: float) -> bool:
+        """Check if a user should receive a notification for this event."""
+        camera = event_data["camera"]
+        label = event_data["label"]
+        entered_zones = event_data["entered_zones"]
+
+        # Check user enabled, label match, camera match, and zone match
+        if (not config["enabled"] or
+            label not in config["labels"] or
+            (config["cameras"] and camera not in config["cameras"]) or
+            (config["zones"] and not any(zone in config["zones"] for zone in entered_zones))):
+            return False
+
+        # Check cooldown period
+        cooldown_key = f"{config['notify']}/{camera}"
+        return current_time - self.msg_cooldown.get(cooldown_key, 0) >= config["cooldown"]
 
     def _download_media_with_retry(
         self, event_id: str, camera: str, endpoint: str, extension: str,
@@ -450,39 +449,22 @@ class FrigateNotification(hass.Hass):
         start_time = time.time()
         attempt = 0
 
-        self.log(
-            f"DEBUG[{event_suffix}]: Starting {endpoint} download with {timeout}s timeout, {retry_interval}s retry interval"
-        )
-
         while time.time() - start_time < timeout:
             attempt += 1
-            elapsed = time.time() - start_time
-
             try:
-                self.log(f"DEBUG[{event_suffix}]: {endpoint} download attempt {attempt} (elapsed: {elapsed:.1f}s)")
                 media_path = self._download_media(event_id, camera, endpoint, extension, event_suffix)
                 if media_path:
-                    self.log(
-                        f"DEBUG[{event_suffix}]: {endpoint} download successful on attempt {attempt} after {elapsed:.1f}s"
-                    )
                     return media_path
-                else:
-                    self.log(f"DEBUG[{event_suffix}]: {endpoint} download returned None on attempt {attempt}")
             except Exception as e:
                 line_num = sys.exc_info()[2].tb_lineno
                 self.log(
-                    f"ERROR: Media download attempt failed for event {event_id} ({endpoint}): {e} (line {line_num})",
+                    f"ERROR: Media download attempt {attempt} failed for {event_id}: {e} (line {line_num})",
                     level="ERROR"
                 )
 
+            # Wait before retry if time remaining
             if time.time() - start_time < timeout:
-                self.log(f"DEBUG[{event_suffix}]: Waiting {retry_interval}s before next {endpoint} attempt")
                 time.sleep(retry_interval)
-
-        self.log(f"DEBUG[{event_suffix}]: {endpoint} download timeout after {timeout}s ({attempt} attempts)")
-        self.log(
-            f"DEBUG[{event_suffix}]: Download state - {endpoint} failed after {attempt} attempts, total time: {timeout}s"
-        )
         return None
 
     def _download_media(
@@ -495,44 +477,26 @@ class FrigateNotification(hass.Hass):
 
         cache_key = f"{event_id}_{camera}_{endpoint}"
 
-        self.log(f"DEBUG[{event_suffix}]: Checking cache for {endpoint} (key: {cache_key})")
-
         # Check cache first
         with self.cache_lock:
             if cache_key in self.file_cache:
                 cache_entry = self.file_cache[cache_key]
                 cache_age = (datetime.now() - cache_entry["timestamp"]).total_seconds()
                 if cache_age < self.cache_ttl_hours * 3600:
-                    self.log(
-                        f"DEBUG[{event_suffix}]: {endpoint} found in cache (age: {cache_age:.1f}s), "
-                        f"returning: {cache_entry['file_path']}"
-                    )
-                    self.log(
-                        f"DEBUG[{event_suffix}]: Cache state - Using cached file: {cache_entry['file_path']} "
-                        f"(size: {cache_entry['size']} bytes)"
-                    )
                     return cache_entry["file_path"]
-                else:
-                    self.log(f"DEBUG[{event_suffix}]: {endpoint} cache entry expired (age: {cache_age:.1f}s)")
-            else:
-                self.log(f"DEBUG[{event_suffix}]: {endpoint} not found in cache")
 
         # Download new media
         now = datetime.now()
         timestamp = now.strftime("%Y%m%d_%H:%M:%S")
         date_dir = now.strftime("%Y-%m-%d")
         target_dir = self.snapshot_dir / camera / date_dir
-
-        self.log(f"DEBUG[{event_suffix}]: Creating target directory: {target_dir}")
         target_dir.mkdir(parents=True, exist_ok=True)
 
         filename = f"{timestamp}--{event_id}{extension}"
         target_path = target_dir / filename
 
-        self.log(f"DEBUG[{event_suffix}]: Target file path: {target_path}")
-
         if target_path.exists():
-            self.log(f"DEBUG[{event_suffix}]: {endpoint} file already exists, adding to cache")
+            # Add existing file to cache
             with self.cache_lock:
                 file_size = target_path.stat().st_size
                 self.file_cache[cache_key] = {
@@ -541,57 +505,31 @@ class FrigateNotification(hass.Hass):
                     "size": file_size,
                     "checksum": hashlib.md5(f"{cache_key}_{file_size}".encode()).hexdigest()
                 }
-            relative_path = f"{camera}/{date_dir}/{filename}"
-            self.log(f"DEBUG[{event_suffix}]: Returning existing {endpoint} file: {relative_path}")
-            return relative_path
+            return f"{camera}/{date_dir}/{filename}"
 
         media_url = f"{self.frigate_url}/{event_id}/{endpoint}"
-        self.log(f"DEBUG[{event_suffix}]: Downloading {endpoint} from URL: {media_url}")
-
         req = urllib.request.Request(media_url)
         req.add_header('User-Agent', 'FrigateNotifier/1.0')
 
         try:
             with urllib.request.urlopen(req, timeout=self.connection_timeout) as response:
-                self.log(f"DEBUG[{event_suffix}]: {endpoint} HTTP response received (status: {response.status})")
-
-                # Check for HTTP error status codes
                 if response.status >= 400:
-                    self.log(
-                        f"ERROR[{event_suffix}]: {endpoint} HTTP error {response.status} - treating as failed download"
-                    )
                     raise Exception(f"HTTP Error {response.status}")
-
-                # Check content type to ensure we got the right file type
-                content_type = response.headers.get('Content-Type', '')
-                if endpoint == "snapshot.jpg" and not content_type.startswith('image/'):
-                    self.log(f"WARNING[{event_suffix}]: snapshot.jpg has unexpected content type: {content_type}")
 
                 content = response.read()
                 file_size = len(content)
-                self.log(f"DEBUG[{event_suffix}]: Downloaded {file_size} bytes, content-type: {content_type}")
 
-                # Check for completely empty files
+                # Validate file size
                 if file_size == 0:
-                    self.log(f"ERROR[{event_suffix}]: {endpoint} file is empty (0 bytes) - treating as failed download")
                     raise ValueError("File is empty: 0 bytes")
+                if file_size < 50000:  # Minimum 50KB for images
+                    raise ValueError(f"File too small: {file_size} bytes")
 
-                # Check for too small image files
-                min_size = 50000  # 50KB
-                if file_size < min_size:
-                    self.log(
-                        f"ERROR[{event_suffix}]: {endpoint} file too small ({file_size} bytes) - "
-                        f"treating as failed download (minimum: {min_size} bytes)"
-                    )
-                    raise ValueError(f"File too small: {file_size} bytes (minimum: {min_size} bytes)")
-
-                self.log(f"DEBUG[{event_suffix}]: Image file size acceptable ({file_size} bytes)")
-
+                # Write file to disk
                 with open(target_path, 'wb') as f:
                     f.write(content)
 
-                self.log(f"DEBUG[{event_suffix}]: {endpoint} downloaded successfully ({file_size} bytes)")
-
+            # Cache the downloaded file
             with self.cache_lock:
                 self.file_cache[cache_key] = {
                     "file_path": str(target_path),
@@ -599,16 +537,12 @@ class FrigateNotification(hass.Hass):
                     "size": file_size,
                     "checksum": hashlib.md5(f"{cache_key}_{file_size}".encode()).hexdigest()
                 }
-            relative_path = f"{camera}/{date_dir}/{filename}"
-            self.log(f"DEBUG[{event_suffix}]: {endpoint} download complete, returning: {relative_path}")
-            return relative_path
+            return f"{camera}/{date_dir}/{filename}"
 
-        except Exception as e:
-            self.log(f"DEBUG[{event_suffix}]: {endpoint} download failed: {e}")
-            # Clean up partial file if it exists
+        except Exception:
+            # Clean up partial file on error
             if target_path.exists():
                 target_path.unlink()
-                self.log(f"DEBUG[{event_suffix}]: Removed partial {endpoint} file")
             raise
 
     def _send_notifications(
@@ -668,60 +602,39 @@ class FrigateNotification(hass.Hass):
         }
 
         # Add media to notification (image only now)
+        # Add image to notification if available
         if media_path and self.ext_domain and media_type == "image":
-            # Fix double slash issue by ensuring proper path construction
-            if media_path.startswith('/'):
-                media_path = media_path[1:]  # Remove leading slash
-            media_url = f"{self.ext_domain}/local/frigate/{media_path}"
+            media_url = f"{self.ext_domain}/local/frigate/{media_path.lstrip('/')}"
             notification_data["image"] = media_url
-            self.log(f"DEBUG[{event_suffix}]: Added image to notification: {media_url}")
-            self.log(f"DEBUG[{event_suffix}]: Notification state - Image media attached")
-        else:
-            self.log(
-                f"DEBUG[{event_suffix}]: No image attached to notification "
-                f"(media_path: {media_path}, media_type: {media_type}, ext_domain: {self.ext_domain})"
-            )
-            self.log(f"DEBUG[{event_suffix}]: Notification state - No image attached")
 
-        # Send to each configured person
+        # Send notifications to eligible users
         notifications_sent = 0
         current_time = time.time()
         title = f"{label} @ {camera}"
         message = f"{timestamp} - {zone_str} (ID: {event_id})"
         media_info = f" - {media_type}: {media_path}" if media_path else " - no media"
 
-        for person_config in self.person_configs:
-            # Combined validation check
-            if (not person_config["enabled"] or
-                label not in person_config["labels"] or
-                (person_config["cameras"] and camera not in person_config["cameras"]) or
-                (person_config["zones"] and not any(zone in person_config["zones"] for zone in entered_zones))):
+        for config in self.person_configs:
+            # Skip if user doesn't match criteria or is in cooldown
+            if not self._should_notify_user(config, event_data, current_time):
                 continue
 
-            # Check and update cooldown
-            cooldown_key = f"{person_config['notify']}/{camera}"
-            if current_time - self.msg_cooldown.get(cooldown_key, 0) < person_config["cooldown"]:
-                continue
-
-            # Send notification
-            self.call_service(f"notify/{person_config['notify']}", title=title, message=message, data=notification_data)
+            # Send notification and update cooldown
+            self.call_service(f"notify/{config['notify']}", title=title, message=message, data=notification_data)
+            cooldown_key = f"{config['notify']}/{camera}"
             self.msg_cooldown[cooldown_key] = current_time
             notifications_sent += 1
 
-            self.log(f"Notification sent to {person_config['name']} - {title} - Event ID: {event_id}{media_info}")
+            self.log(f"Notification sent to {config['name']} - {title} - Event ID: {event_id}{media_info}")
 
-        self.log(f"DEBUG[{event_suffix}]: Sent {notifications_sent} notifications total")
-        self.log(f"DEBUG[{event_suffix}]: Notification state - Completed sending {notifications_sent} notifications")
-
-        # Record notification time
+        # Record metrics and log completion
         notification_time = time.time() - notification_start
         with self.metrics_lock:
             self.notification_times.append(notification_time)
-            # Save metrics immediately after each notification
             self._save_todays_metrics()
 
-        self.log(f"DEBUG[{event_suffix}]: Notification process completed in {notification_time:.3f}s")
-        self.log(f"DEBUG[{event_suffix}]: Final state - Notification process successful")
+        if notifications_sent > 0:
+            self.log(f"Sent {notifications_sent} notifications for {event_id} in {notification_time:.3f}s")
 
     def _log_daily_metrics(self, **kwargs) -> None:
         """Log daily notification performance metrics and enrich previous day's data."""
@@ -734,24 +647,23 @@ class FrigateNotification(hass.Hass):
                     self.log("METRICS: No notifications sent today")
                     return
 
-                # Calculate statistics
+                # Calculate statistics using consolidated method
                 stats = {}
                 if self.notification_times:
-                    notification_stats = self._calculate_stats(self.notification_times)
-                    stats.update({
-                        "total_notifications": len(self.notification_times),
-                        "min_seconds": notification_stats["min"],
-                        "avg_seconds": notification_stats["avg"],
-                        "max_seconds": notification_stats["max"]
-                    })
+                    stats.update(self._create_metrics_dict(self.notification_times, "notification"))
+                    # Add backward compatibility keys
+                    stats["total_notifications"] = stats.get("total_notification", 0)
+                    stats["min_seconds"] = stats.get("min_notification_seconds", 0)
+                    stats["avg_seconds"] = stats.get("avg_notification_seconds", 0)
+                    stats["max_seconds"] = stats.get("max_notification_seconds", 0)
 
                 if self.delivery_times:
-                    delivery_stats = self._calculate_stats(self.delivery_times)
+                    delivery_stats = self._create_metrics_dict(self.delivery_times, "delivery")
                     stats.update({
-                        "total_deliveries": len(self.delivery_times),
-                        "min_delivery_seconds": delivery_stats["min"],
-                        "avg_delivery_seconds": delivery_stats["avg"],
-                        "max_delivery_seconds": delivery_stats["max"]
+                        "total_deliveries": delivery_stats.get("total_delivery", 0),
+                        "min_delivery_seconds": delivery_stats.get("min_delivery_seconds", 0),
+                        "avg_delivery_seconds": delivery_stats.get("avg_delivery_seconds", 0),
+                        "max_delivery_seconds": delivery_stats.get("max_delivery_seconds", 0)
                     })
 
                 # Add comparison if yesterday's data exists
@@ -842,7 +754,8 @@ class FrigateNotification(hass.Hass):
 
                     notif_count, delivery_count = len(self.notification_times), len(self.delivery_times)
                     self.log(
-                        f"DEBUG: Loaded {notif_count} notification times and {delivery_count} delivery times from today's metrics"
+                        f"DEBUG: Loaded {notif_count} notification times and {delivery_count} delivery times "
+                        f"from today's metrics"
                     )
                     return
 
@@ -903,27 +816,20 @@ class FrigateNotification(hass.Hass):
             # Find yesterday's entry
             for entry in data.get("daily_metrics", []):
                 if entry.get("date") == yesterday:
-                    # Calculate statistics for notification_times
-                    if "notification_times" in entry and entry["notification_times"]:
-                        times = entry["notification_times"]
-                        entry["notification_times"] = self._create_enriched_metrics(times, "notification")
-                        nt = entry['notification_times']
-                        self.log(
-                            f"Enriched yesterday's notification metrics: {len(times)} notifications, "
-                            f"min={nt['min_notification_seconds']}s, avg={nt['avg_notification_seconds']}s, "
-                            f"max={nt['max_notification_seconds']}s, std={nt['std_notification_seconds']}s"
-                        )
-
-                    # Calculate statistics for delivery_times
-                    if "delivery_times" in entry and entry["delivery_times"]:
-                        times = entry["delivery_times"]
-                        entry["delivery_times"] = self._create_enriched_metrics(times, "delivery")
-                        dt = entry['delivery_times']
-                        self.log(
-                            f"Enriched yesterday's delivery metrics: {len(times)} deliveries, "
-                            f"min={dt['min_delivery_seconds']}s, avg={dt['avg_delivery_seconds']}s, "
-                            f"max={dt['max_delivery_seconds']}s, std={dt['std_delivery_seconds']}s"
-                        )
+                    # Enrich notification and delivery times with statistics
+                    for metric_type in ["notification", "delivery"]:
+                        key = f"{metric_type}_times"
+                        if key in entry and entry[key]:
+                            times = entry[key]
+                            entry[key] = self._create_metrics_dict(times, metric_type, include_raw=True)
+                            metrics = entry[key]
+                            self.log(
+                                f"Enriched yesterday's {metric_type} metrics: {metrics[f'total_{metric_type}']} events, "
+                                f"min={metrics[f'min_{metric_type}_seconds']}s, "
+                                f"avg={metrics[f'avg_{metric_type}_seconds']}s, "
+                                f"max={metrics[f'max_{metric_type}_seconds']}s, "
+                                f"std={metrics[f'std_{metric_type}_seconds']}s"
+                            )
 
                     # Save the enriched data back to file
                     with open(self.metrics_file, 'w') as f:
