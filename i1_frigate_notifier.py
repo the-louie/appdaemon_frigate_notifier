@@ -45,8 +45,6 @@ from typing import Any, Dict, Optional
 class FrigateNotification(hass.Hass):
     """AppDaemon app for sending Frigate motion notifications."""
 
-
-
     def _extract_metrics_from_entry(self, entry: Dict[str, Any], metric_type: str) -> Dict[str, Any]:
         """Extract metrics from entry in either old or new format."""
         result = {}
@@ -129,8 +127,6 @@ class FrigateNotification(hass.Hass):
 
         # Load today's metrics on startup
         self._load_todays_metrics()
-
-
 
         self._load_config()
         self._setup_mqtt()
@@ -232,8 +228,6 @@ class FrigateNotification(hass.Hass):
             except Exception as e:
                 self.log(f"ERROR: Event processing worker error: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
-
-
     def _handle_mqtt_message(self, event_name: str, data: Dict[str, Any], kwargs: Dict[str, Any]) -> None:
         """Handle incoming MQTT messages from Frigate."""
         try:
@@ -325,8 +319,6 @@ class FrigateNotification(hass.Hass):
 
         except Exception as e:
             self.log(f"ERROR: Failed to process notification received event: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
-
-
 
     def _extract_event_data(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Extract and validate event data from payload."""
@@ -468,7 +460,7 @@ class FrigateNotification(hass.Hass):
         if not self.snapshot_dir:
             self.log(f"ERROR[{event_suffix}]: No snapshot directory configured, cannot download {endpoint}")
             return None
-            
+
         cache_key = f"{event_id}_{camera}_{endpoint}"
 
         self.log(f"DEBUG[{event_suffix}]: Checking cache for {endpoint} (key: {cache_key})")
@@ -484,10 +476,8 @@ class FrigateNotification(hass.Hass):
                     return cache_entry["file_path"]
                 else:
                     self.log(f"DEBUG[{event_suffix}]: {endpoint} cache entry expired (age: {cache_age:.1f}s)")
-                    self.log(f"DEBUG[{event_suffix}]: Cache state - Expired cache entry, will download fresh")
             else:
                 self.log(f"DEBUG[{event_suffix}]: {endpoint} not found in cache")
-                self.log(f"DEBUG[{event_suffix}]: Cache state - No cache entry, will download fresh")
 
         # Download new media
         now = datetime.now()
@@ -502,7 +492,6 @@ class FrigateNotification(hass.Hass):
         target_path = target_dir / filename
 
         self.log(f"DEBUG[{event_suffix}]: Target file path: {target_path}")
-        self.log(f"DEBUG[{event_suffix}]: Download state - Starting fresh download to: {target_path}")
 
         if target_path.exists():
             self.log(f"DEBUG[{event_suffix}]: {endpoint} file already exists, adding to cache")
@@ -516,12 +505,10 @@ class FrigateNotification(hass.Hass):
                 }
             relative_path = f"{camera}/{date_dir}/{filename}"
             self.log(f"DEBUG[{event_suffix}]: Returning existing {endpoint} file: {relative_path}")
-            self.log(f"DEBUG[{event_suffix}]: File state - Using existing file: {relative_path} (size: {file_size} bytes)")
             return relative_path
 
         media_url = f"{self.frigate_url}/{event_id}/{endpoint}"
         self.log(f"DEBUG[{event_suffix}]: Downloading {endpoint} from URL: {media_url}")
-        self.log(f"DEBUG[{event_suffix}]: Network state - Initiating HTTP request to Frigate API")
 
         req = urllib.request.Request(media_url)
         req.add_header('User-Agent', 'FrigateNotifier/1.0')
@@ -529,12 +516,10 @@ class FrigateNotification(hass.Hass):
         try:
             with urllib.request.urlopen(req, timeout=self.connection_timeout) as response:
                 self.log(f"DEBUG[{event_suffix}]: {endpoint} HTTP response received (status: {response.status})")
-                self.log(f"DEBUG[{event_suffix}]: Network state - HTTP {response.status} response received")
 
                 # Check for HTTP error status codes
                 if response.status >= 400:
                     self.log(f"ERROR[{event_suffix}]: {endpoint} HTTP error {response.status} - treating as failed download")
-                    self.log(f"DEBUG[{event_suffix}]: Network state - HTTP error response, download failed")
                     raise Exception(f"HTTP Error {response.status}")
 
                 # Check content type to ensure we got the right file type
@@ -544,28 +529,25 @@ class FrigateNotification(hass.Hass):
 
                 content = response.read()
                 file_size = len(content)
-                self.log(f"DEBUG[{event_suffix}]: File state - Downloaded {file_size} bytes, content-type: {content_type}")
+                self.log(f"DEBUG[{event_suffix}]: Downloaded {file_size} bytes, content-type: {content_type}")
 
                 # Check for completely empty files
                 if file_size == 0:
                     self.log(f"ERROR[{event_suffix}]: {endpoint} file is empty (0 bytes) - treating as failed download")
-                    self.log(f"DEBUG[{event_suffix}]: File state - Empty file detected, download failed")
                     raise ValueError("File is empty: 0 bytes")
 
                 # Check for too small image files
                 min_size = 50000  # 50KB
                 if file_size < min_size:
                     self.log(f"ERROR[{event_suffix}]: {endpoint} file too small ({file_size} bytes) - treating as failed download (minimum: {min_size} bytes)")
-                    self.log(f"DEBUG[{event_suffix}]: File state - Image file too small, download failed")
                     raise ValueError(f"File too small: {file_size} bytes (minimum: {min_size} bytes)")
-                else:
-                    self.log(f"DEBUG[{event_suffix}]: File state - Image file size acceptable (size: {file_size} bytes)")
+
+                self.log(f"DEBUG[{event_suffix}]: Image file size acceptable ({file_size} bytes)")
 
                 with open(target_path, 'wb') as f:
                     f.write(content)
 
                 self.log(f"DEBUG[{event_suffix}]: {endpoint} downloaded successfully ({file_size} bytes)")
-                self.log(f"DEBUG[{event_suffix}]: File state - File written to disk: {target_path}")
 
             with self.cache_lock:
                 self.file_cache[cache_key] = {
@@ -574,24 +556,17 @@ class FrigateNotification(hass.Hass):
                     "size": file_size,
                     "checksum": hashlib.md5(f"{cache_key}_{file_size}".encode()).hexdigest()
                 }
-                self.log(f"DEBUG[{event_suffix}]: Cache state - Added to cache: {cache_key} (size: {file_size} bytes)")
-
             relative_path = f"{camera}/{date_dir}/{filename}"
             self.log(f"DEBUG[{event_suffix}]: {endpoint} download complete, returning: {relative_path}")
-            self.log(f"DEBUG[{event_suffix}]: Download state - Successfully completed download")
             return relative_path
 
         except Exception as e:
             self.log(f"DEBUG[{event_suffix}]: {endpoint} download failed: {e}")
-            self.log(f"DEBUG[{event_suffix}]: Download state - Exception occurred during download")
             # Clean up partial file if it exists
             if target_path.exists():
                 target_path.unlink()
                 self.log(f"DEBUG[{event_suffix}]: Removed partial {endpoint} file")
-                self.log(f"DEBUG[{event_suffix}]: File state - Cleaned up partial file")
             raise
-
-
 
     def _send_notifications(self, event_data: Dict[str, Any], media_path: Optional[str], media_type: Optional[str], event_suffix: str) -> None:
         """Send notifications to configured persons."""
@@ -649,8 +624,6 @@ class FrigateNotification(hass.Hass):
             self.log(f"DEBUG[{event_suffix}]: No image attached to notification (media_path: {media_path}, media_type: {media_type}, ext_domain: {self.ext_domain})")
             self.log(f"DEBUG[{event_suffix}]: Notification state - No image attached")
 
-
-
         # Send to each configured person
         notifications_sent = 0
         for person_config in self.person_configs:
@@ -692,8 +665,6 @@ class FrigateNotification(hass.Hass):
         self.log(f"DEBUG[{event_suffix}]: Notification process completed in {notification_time:.3f}s")
         self.log(f"DEBUG[{event_suffix}]: Final state - Notification process successful")
 
-
-
     def _log_daily_metrics(self, **kwargs) -> None:
         """Log daily notification performance metrics and enrich previous day's data."""
         try:
@@ -725,8 +696,6 @@ class FrigateNotification(hass.Hass):
                         "max_delivery_seconds": delivery_stats["max"]
                     })
 
-
-
                 # Add comparison if yesterday's data exists
                 yesterday_metrics = self._load_yesterday_metrics()
                 comparison = {}
@@ -744,8 +713,6 @@ class FrigateNotification(hass.Hass):
                             "avg_delivery_diff": round(stats["avg_delivery_seconds"] - yesterday_metrics["avg_delivery_seconds"], 3),
                             "max_delivery_diff": round(stats["max_delivery_seconds"] - yesterday_metrics["max_delivery_seconds"], 3)
                         })
-
-
 
                 # Log metrics (data is already saved continuously)
 
@@ -877,8 +844,6 @@ class FrigateNotification(hass.Hass):
         except Exception as e:
             self.log(f"ERROR: Failed to enrich yesterday's metrics: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
 
-
-
     def _load_yesterday_metrics(self) -> Optional[Dict[str, Any]]:
         """Load yesterday's metrics from file."""
         try:
@@ -901,8 +866,6 @@ class FrigateNotification(hass.Hass):
         except Exception as e:
             self.log(f"ERROR: Failed to load yesterday's metrics: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
             return None
-
-
 
     def _cleanup_old_files(self, **kwargs) -> None:
         """Clean up old image files to prevent disk space issues."""
