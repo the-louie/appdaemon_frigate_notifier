@@ -523,23 +523,24 @@ class FrigateNotification(hass.Hass):
     def _cleanup_notified_events(self, **kwargs) -> None:
         """Clean up notified events set to prevent memory leaks."""
         try:
-            with self.notification_lock:
-                if len(self.notified_events) > self.MAX_NOTIFIED_EVENTS:
-                    self.notified_events.clear()
-                    self.log("Cleaned up notified events set to prevent memory leaks")
-
             # CRITICAL: Clean up cooldown dictionary to prevent memory leak
             current_time = time.time()
             max_cooldown = max((config.get("cooldown", 0) for config in self.person_configs), default=3600)
             cutoff_time = current_time - (max_cooldown * 2)  # Keep 2x max cooldown for safety
-
-            keys_to_remove = [key for key, timestamp in self.msg_cooldown.items() if timestamp < cutoff_time]
-            for key in keys_to_remove:
-                del self.msg_cooldown[key]
-
-            if keys_to_remove:
-                self.log(f"Cleaned up {len(keys_to_remove)} expired cooldown entries to prevent memory leak")
-
+            
+            with self.notification_lock:
+                if len(self.notified_events) > self.MAX_NOTIFIED_EVENTS:
+                    self.notified_events.clear()
+                    self.log("Cleaned up notified events set to prevent memory leaks")
+                
+                # Clean up cooldown dictionary (must be inside same lock as notifications)
+                keys_to_remove = [key for key, timestamp in self.msg_cooldown.items() if timestamp < cutoff_time]
+                for key in keys_to_remove:
+                    del self.msg_cooldown[key]
+                    
+                if keys_to_remove:
+                    self.log(f"Cleaned up {len(keys_to_remove)} expired cooldown entries to prevent memory leak")
+                
         except Exception as e:
             self._log_error("Failed to cleanup notified events", e)
 
