@@ -108,7 +108,7 @@ class FrigateNotification(hass.Hass):
         self.notification_lock = threading.Lock()
 
         # Circuit breaker for download failures
-        # Circuit breaker state: endpoint -> {"failures": count, "last_failure": timestamp, "state": "closed"|"open"|"half_open"}
+        # Circuit breaker state tracking: endpoint -> failure info and state
         self.circuit_breaker_state = {}
         self.circuit_breaker_lock = threading.Lock()
 
@@ -269,9 +269,8 @@ class FrigateNotification(hass.Hass):
             with self.queue_lock:
                 if len(self.event_queue) < 1000:
                     self.event_queue.append(event_data)
-                    self.log(f"DEBUG[{event_suffix}]: Event queued (size: {len(self.event_queue)})")
                 else:
-                    self.log(f"DEBUG[{event_suffix}]: Event queue full, dropping event")
+                    self.log(f"Event queue full, dropping event {event_suffix}")
 
         except Exception as e:
             line_num = sys.exc_info()[2].tb_lineno
@@ -348,16 +347,10 @@ class FrigateNotification(hass.Hass):
 
     def _process_event(self, event_data: Dict[str, Any]) -> None:
         """Process a Frigate event."""
-        event_id = event_data["event_id"]
-        event_suffix = event_id.split('-')[-1] if '-' in event_id else event_id
-
         try:
             # Skip zone filtering check if only_zones is disabled or zones exist
             if self.only_zones and not event_data["entered_zones"]:
-                self.log(f"DEBUG[{event_suffix}]: Skipping - only_zones enabled but no zones entered")
                 return
-
-            self.log(f"DEBUG[{event_suffix}]: Processing {event_data['camera']}/{event_data['label']} event")
             self.executor.submit(self._download_and_notify, event_data)
 
         except Exception as e:
@@ -522,12 +515,12 @@ class FrigateNotification(hass.Hass):
 
         return any(msg in error_str for msg in retryable_messages)
 
-        def _download_media_with_retry(
+    def _download_media_with_retry(
         self, event_id: str, camera: str, endpoint: str, extension: str,
         max_timeout: int, event_suffix: str
     ) -> Optional[str]:
         """Download media with exponential backoff, jitter, and circuit breaker.
-        
+
         Args:
             event_id: Frigate event ID
             camera: Camera name
@@ -535,7 +528,7 @@ class FrigateNotification(hass.Hass):
             extension: File extension
             max_timeout: Maximum total time to spend on retries
             event_suffix: Event suffix for logging
-            
+
         Returns:
             Path to downloaded media file or None if failed
         """
@@ -562,7 +555,7 @@ class FrigateNotification(hass.Hass):
                 else:
                     # No exception but no media path - record as failure
                     self._record_circuit_failure(circuit_key)
-                    
+
             except Exception as e:
                 line_num = sys.exc_info()[2].tb_lineno
                 error_type = type(e).__name__
@@ -688,7 +681,6 @@ class FrigateNotification(hass.Hass):
         cooldown periods) and sends Rich notifications with action buttons.
         """
         if not self.person_configs:
-            self.log(f"DEBUG[{event_suffix}]: No person configs found, skipping notifications")
             return
 
         event_id = event_data["event_id"]
@@ -696,7 +688,6 @@ class FrigateNotification(hass.Hass):
         # Check if this event has already been notified to prevent duplicates
         with self.notification_lock:
             if event_id in self.notified_events:
-                self.log(f"DEBUG[{event_suffix}]: Event already notified, skipping duplicate notification")
                 return
             self.notified_events.add(event_id)
 
@@ -758,7 +749,6 @@ class FrigateNotification(hass.Hass):
         notification_time = time.time() - notification_start
         with self.metrics_lock:
             self.notification_times.append(notification_time)
-            self._save_todays_metrics()
 
         if notifications_sent > 0:
             self.log(f"Sent {notifications_sent} notifications for {event_id} in {notification_time:.3f}s")
@@ -790,10 +780,6 @@ class FrigateNotification(hass.Hass):
                         "max_delivery_seconds": delivery_stats.get("max_delivery_seconds", 0)
                     })
 
-                # Log metrics without comparison (simplified)
-
-                # Log metrics (data is already saved continuously)
-
                 # Build efficient log message
                 log_components = ["METRICS:"]
 
@@ -809,14 +795,11 @@ class FrigateNotification(hass.Hass):
                         f"Avg={stats['avg_delivery_seconds']}s, Max={stats['max_delivery_seconds']}s"
                     )
 
-                # Log current day metrics only
-
                 self.log(" | ".join(log_components))
 
-                # Clear today's data for next day and save empty state
+                # Clear today's data for next day
                 self.notification_times.clear()
                 self.delivery_times.clear()
-                self._save_todays_metrics()
 
         except Exception as e:
             self.log(f"ERROR: Failed to log daily metrics: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
@@ -825,7 +808,6 @@ class FrigateNotification(hass.Hass):
         """Load today's metrics from file on startup."""
         try:
             if not self.metrics_file.exists():
-                self.log("DEBUG: No metrics file found, starting fresh")
                 return
 
             with open(self.metrics_file, 'r') as f:
@@ -840,14 +822,7 @@ class FrigateNotification(hass.Hass):
                     if "delivery_times" in entry:
                         self.delivery_times = entry["delivery_times"]
 
-                    notif_count, delivery_count = len(self.notification_times), len(self.delivery_times)
-                    self.log(
-                        f"DEBUG: Loaded {notif_count} notification times and {delivery_count} delivery times "
-                        f"from today's metrics"
-                    )
                     return
-
-            self.log("DEBUG: No today's metrics found in file, starting fresh")
 
         except Exception as e:
             self.log(f"ERROR: Failed to load today's metrics: {e} (line {sys.exc_info()[2].tb_lineno})", level="ERROR")
