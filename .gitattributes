@@ -1,0 +1,28 @@
+# Line endings are normalised to LF in the repository.
+#
+# Added 2026-08-31, after commit 6446235 ("catchup") in appdaemon_wakeup_music
+# rewrote every line of i1_wakeup_music.py as CRLF. The content was
+# byte-identical -- verified by comparing both blobs with \r stripped -- but
+# the diff read as 1445 insertions and 1445 deletions. That makes review
+# impossible, and would have concealed a real change had one been mixed in.
+# Backlog tickets T-20..T-29 cite line numbers in that file, so the risk was
+# concrete. appdaemon_automatic_lights had drifted the same way, 912 lines.
+#
+# Most repos carrying this file were clean when it was added. It is here so
+# they stay that way: the cause was an editor on another machine, and that
+# machine will be used again.
+#
+# text=auto lets git detect which files are text; eol=lf pins the
+# working-tree ending so CRLF cannot be reintroduced.
+#
+# Keep this file identical across every app repo, so that a diff between any
+# two of them means something. Enforced by tests/test_line_endings.py.
+* text=auto eol=lf
+
+# Binary formats are never normalised. These carry incidental \r\n byte pairs
+# that a text pass would corrupt.
+*.parquet binary
+*.joblib  binary
+*.pyc     binary
+*.png     binary
+*.jpg     binary
