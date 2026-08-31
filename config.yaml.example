@@ -14,15 +14,23 @@ frigate_notify:
 
   # Storage Configuration
   #
-  # MUST live outside Home Assistant's configuration directory. Anything under
-  # <config> -- including <config>/www, which /local/ serves -- is archived in
-  # every backup. Measured 2026-08-31: 19.5 GB per automatic backup, which is
-  # far over Nabu Casa's per-backup limit and is why no offsite backup had ever
-  # run. /media is outside the config tree and outside the backup.
+  # This is the path inside the APPDAEMON container, and it can be anything --
+  # the constraint that matters is on the Home Assistant side.
   #
-  # This is the path INSIDE the AppDaemon container; it must be bind-mounted to
-  # the same host directory Home Assistant sees as /media/frigate.
-  snapshot_dir: "/media/frigate"
+  # Home Assistant must NOT mount the same host directory anywhere under
+  # /config. A backup archives /config, and from inside the container a bind
+  # mount is just a directory, so the backup walks straight into it. On this
+  # deployment the store is one host directory shared by both containers:
+  #
+  #   /mnt/storage/frigate_snapshots_appdaemon
+  #       -> appdaemon    /snapshots        (rw)
+  #       -> homeassistant /media/frigate   (ro)   <- was /config/www/frigate
+  #
+  # While it was mounted at /config/www/frigate, every automatic backup came to
+  # 19.5 GB (measured 2026-08-31) -- far over Nabu Casa's per-backup limit,
+  # which is why no offsite backup had ever run. The files never moved; only
+  # Home Assistant's mount point did.
+  snapshot_dir: "/snapshots"
 
   # URL prefix the phone uses to fetch the snapshot. Deliberately RELATIVE.
   #
