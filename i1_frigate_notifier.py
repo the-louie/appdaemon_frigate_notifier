@@ -131,6 +131,27 @@ class FrigateNotification(hass.Hass):
         self.cache_ttl_hours = self.args.get("cache_ttl_hours", 24)
         self.connection_timeout = self.args.get("connection_timeout", 30)
 
+        # URL prefix the phone uses to fetch a snapshot. See H-09.
+        #
+        # Snapshots used to live under <config>/www and be served from /local/,
+        # which is unauthenticated -- convenient, but it put them inside the
+        # Home Assistant configuration directory, and therefore inside every
+        # backup. Measured 2026-08-31: 19.5 GB per automatic backup, far over
+        # Nabu Casa's limit, which is why no offsite copy has ever run.
+        #
+        # /media is outside the config directory and outside the backup, but it
+        # requires authentication -- verified, /media/local/... returns 401
+        # without a token. An ABSOLUTE url therefore cannot work here: the
+        # companion app does not send credentials to an arbitrary external
+        # host. A RELATIVE path does work, because the app resolves it against
+        # its own instance URL and authenticates. This is the same mechanism
+        # that lets /api/camera_proxy/... be attached to a notification.
+        #
+        # Keep it configurable: if a client ever needs the old unauthenticated
+        # form, set this back to "<ext_domain>/local/frigate" without a code
+        # change. Note that doing so re-opens SEC-2.
+        self.media_url_base = self.args.get("media_url_base", "/media/local/frigate")
+
         # Face detection configuration
         self.face_detection_enabled = self.args.get("face_detection_enabled", True)
         threshold = self.args.get("face_detection_threshold", 0.7)
@@ -532,7 +553,7 @@ class FrigateNotification(hass.Hass):
         }
 
         if media_path and media_type == "image":
-            notification_data["image"] = f"{self.ext_domain}/local/frigate/{media_path.replace('\\', '/').lstrip('/')}"
+            notification_data["image"] = f"{self.media_url_base.rstrip('/')}/{media_path.replace('\\', '/').lstrip('/')}"
 
         # Build notification content
         face_detected = event_data.get("face_detected")

@@ -13,7 +13,29 @@ frigate_notify:
   ext_domain: "https://your-external-domain.com"
 
   # Storage Configuration
-  snapshot_dir: "/config/frigate_snapshots"
+  #
+  # MUST live outside Home Assistant's configuration directory. Anything under
+  # <config> -- including <config>/www, which /local/ serves -- is archived in
+  # every backup. Measured 2026-08-31: 19.5 GB per automatic backup, which is
+  # far over Nabu Casa's per-backup limit and is why no offsite backup had ever
+  # run. /media is outside the config tree and outside the backup.
+  #
+  # This is the path INSIDE the AppDaemon container; it must be bind-mounted to
+  # the same host directory Home Assistant sees as /media/frigate.
+  snapshot_dir: "/media/frigate"
+
+  # URL prefix the phone uses to fetch the snapshot. Deliberately RELATIVE.
+  #
+  # /media requires authentication (verified: /media/local/... returns 401
+  # without a token), so an absolute URL on ext_domain cannot work -- the
+  # companion app does not send credentials to an arbitrary external host. A
+  # relative path does work: the app resolves it against its own instance URL
+  # and authenticates, the same way /api/camera_proxy/... does.
+  #
+  # Setting this to "<ext_domain>/local/frigate" restores the old behaviour
+  # without a code change, but re-opens SEC-2 -- /local/ is unauthenticated, so
+  # every snapshot becomes a publicly reachable URL.
+  media_url_base: "/media/local/frigate"
 
   # Filtering Options
   only_zones: true  # Only notify when objects enter zones
