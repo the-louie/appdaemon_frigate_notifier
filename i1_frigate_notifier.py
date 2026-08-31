@@ -33,6 +33,7 @@ Configuration:
 
 import hashlib
 import json
+import re
 import sys
 import threading
 import time
@@ -44,6 +45,32 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import appdaemon.plugins.hass.hassapi as hass
+
+# Characters permitted in an MQTT-supplied value before it may touch a path or a
+# URL. See SEC-1 in CODEREVIEW-20260829-APDPAMON.frigate.md: `camera` and
+# `event_id` arrive from the broker and were interpolated straight into
+# `snapshot_dir / camera / ...` and into the outbound Frigate URL. pathlib does
+# not normalise `..`, so `camera="../../../../etc/cron.d"` resolved outside the
+# snapshot directory at mkdir time. Reproduced, not theorised.
+_SAFE_PATH_COMPONENT = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def is_safe_path_component(value: Any) -> bool:
+    """True if `value` is safe to use as a single path component.
+
+    The allowlist alone is NOT sufficient, and this is the trap: '.' and '..'
+    consist entirely of permitted characters, so `^[A-Za-z0-9._-]+$` admits
+    them. A `camera` of ".." still escapes one directory level. Both are
+    rejected explicitly.
+
+    Anything containing a separator ('/', '\\') fails the pattern outright,
+    which is what stops the multi-level traversals.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    if value in (".", ".."):
+        return False
+    return bool(_SAFE_PATH_COMPONENT.match(value))
 
 
 class FrigateNotification(hass.Hass):
@@ -246,7 +273,26 @@ class FrigateNotification(hass.Hass):
             if not event_id:
                 return None
 
+            # SEC-1: reject, do not sanitise. Both fields reach a filesystem
+            # path and an outbound URL, and the broker is typically
+            # unauthenticated on the LAN, so anyone who can publish to
+            # frigate/events controls them. Rejecting at the boundary means no
+            # later code path has to remember to be careful.
+            if not is_safe_path_component(event_id):
+                self.log(
+                    f"Rejecting Frigate event: unsafe event id {event_id!r}",
+                    level="WARNING",
+                )
+                return None
+
             camera = event_data.get("camera", "Unknown")
+            if not is_safe_path_component(camera):
+                self.log(
+                    f"Rejecting Frigate event {event_id}: unsafe camera name {camera!r}",
+                    level="WARNING",
+                )
+                return None
+
             label = event_data.get("label", "Unknown")
             entered_zones = event_data.get("entered_zones", [])
 
@@ -340,6 +386,24 @@ class FrigateNotification(hass.Hass):
 
         return None
 
+    def _is_within_snapshot_dir(self, path: Path) -> bool:
+        """True if `path` resolves to somewhere inside snapshot_dir.
+
+        resolve() is what makes this worth having over a string prefix test: it
+        collapses '..' and follows symlinks, so a symlinked camera directory
+        pointing outside the tree is caught too. Both paths are resolved, since
+        snapshot_dir may itself sit behind a symlink.
+
+        Returns False rather than raising on a path the OS cannot resolve --
+        refusing to write is always the safe answer here.
+        """
+        if not self.snapshot_dir:
+            return False
+        try:
+            return path.resolve().is_relative_to(self.snapshot_dir.resolve())
+        except (OSError, ValueError, RuntimeError):
+            return False
+
     def _download_media(self, event_id: str, camera: str, endpoint: str, extension: str) -> Optional[str]:
         """Download media file from Frigate."""
         if not self.snapshot_dir:
@@ -365,11 +429,33 @@ class FrigateNotification(hass.Hass):
         now = datetime.now()
         date_dir = now.strftime("%Y-%m-%d")
         target_dir = self.snapshot_dir / camera / date_dir
+
+        # SEC-1 defence in depth. _extract_event_data already rejects unsafe
+        # values, so reaching this branch means a caller bypassed that gate --
+        # a new code path, a cached entry, or a future refactor. Check anyway:
+        # the cost is one resolve() per download and the failure it prevents is
+        # an arbitrary file write as the AppDaemon user.
+        if not self._is_within_snapshot_dir(target_dir):
+            self.log(
+                f"REFUSING download: target directory {target_dir} escapes "
+                f"{self.snapshot_dir} (camera={camera!r})",
+                level="ERROR",
+            )
+            return None
+
         target_dir.mkdir(parents=True, exist_ok=True)
 
         filename = f"{now.strftime('%Y%m%d_%H%M%S')}--{event_id}{extension}"
         target_path = target_dir / filename
         relative_path = f"{camera}/{date_dir}/{filename}"
+
+        if not self._is_within_snapshot_dir(target_path):
+            self.log(
+                f"REFUSING download: target path {target_path} escapes "
+                f"{self.snapshot_dir} (event_id={event_id!r})",
+                level="ERROR",
+            )
+            return None
 
         if target_path.exists():
             self._cache_file(cache_key, target_path, now, target_path.stat().st_size)
