@@ -131,26 +131,25 @@ class FrigateNotification(hass.Hass):
         self.cache_ttl_hours = self.args.get("cache_ttl_hours", 24)
         self.connection_timeout = self.args.get("connection_timeout", 30)
 
-        # URL prefix the phone uses to fetch a snapshot. See H-09.
+        # How the phone fetches the snapshot. See H-09, and the correction it needed.
         #
-        # Snapshots used to live under <config>/www and be served from /local/,
-        # which is unauthenticated -- convenient, but it put them inside the
-        # Home Assistant configuration directory, and therefore inside every
-        # backup. Measured 2026-08-31: 19.5 GB per automatic backup, far over
-        # Nabu Casa's limit, which is why no offsite copy has ever run.
+        # Snapshots used to live under <config>/www and be served from the
+        # unauthenticated /local/ -- convenient, and inside every backup, which
+        # is what made backups 19.5 GB and stopped the offsite copy running at
+        # all.
         #
-        # /media is outside the config directory and outside the backup, but it
-        # requires authentication -- verified, /media/local/... returns 401
-        # without a token. An ABSOLUTE url therefore cannot work here: the
-        # companion app does not send credentials to an arbitrary external
-        # host. A RELATIVE path does work, because the app resolves it against
-        # its own instance URL and authenticates. This is the same mechanism
-        # that lets /api/camera_proxy/... be attached to a notification.
+        # Moving them to /media fixed the backups and broke the images. /media
+        # requires authentication -- verified, 401 anonymously -- and the
+        # companion app does NOT authenticate it. Notifications arrived with a
+        # blank image and nothing errored anywhere. A full day of alerts went
+        # out with no picture before anyone noticed. Measured 2026-09-01.
         #
-        # Keep it configurable: if a client ever needs the old unauthenticated
-        # form, set this back to "<ext_domain>/local/frigate" without a code
-        # change. Note that doing so re-opens SEC-2.
-        self.media_url_base = self.args.get("media_url_base", "/media/local/frigate")
+        # Frigate's HA integration serves snapshots for notifications at
+        #   /api/frigate/<client_id>/notifications/<event_id>/snapshot.jpg
+        # UNAUTHENTICATED, by design -- that is what makes it usable from a
+        # phone notification. `frigate` is the default client_id and matches
+        # the video action URI below, which has always used this path.
+        self.frigate_client_id = self.args.get("frigate_client_id", "frigate")
 
         # Face detection configuration
         self.face_detection_enabled = self.args.get("face_detection_enabled", True)
@@ -553,7 +552,20 @@ class FrigateNotification(hass.Hass):
         }
 
         if media_path and media_type == "image":
-            notification_data["image"] = f"{self.media_url_base.rstrip('/')}/{media_path.replace('\\', '/').lstrip('/')}"
+            # Serve the image from Frigate's notification endpoint, not from our
+            # own copy. See H-09: the snapshots moved out of <config>/www to
+            # keep them out of every backup, and /media requires authentication
+            # -- verified, it returns 401 anonymously. The companion app does
+            # NOT authenticate that path, so the notification arrived with a
+            # blank image and nothing errored anywhere.
+            #
+            # This endpoint returns the identical bytes without a token
+            # (measured 2026-09-01: both 92326 b for the same event), and it is
+            # the same path the Video action below has always used.
+            notification_data["image"] = (
+                f"{self.ext_domain}/api/frigate/{self.frigate_client_id}"
+                f"/notifications/{event_id}/snapshot.jpg"
+            )
 
         # Build notification content
         face_detected = event_data.get("face_detected")

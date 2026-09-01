@@ -32,18 +32,19 @@ frigate_notify:
   # Home Assistant's mount point did.
   snapshot_dir: "/snapshots"
 
-  # URL prefix the phone uses to fetch the snapshot. Deliberately RELATIVE.
+  # The snapshot in the notification is served by Frigate's Home Assistant
+  # integration, NOT from snapshot_dir:
+  #   <ext_domain>/api/frigate/<frigate_client_id>/notifications/<event_id>/snapshot.jpg
+  # That path is unauthenticated by design, which is what makes it usable from a
+  # phone. The Video action uses the same base path.
   #
-  # /media requires authentication (verified: /media/local/... returns 401
-  # without a token), so an absolute URL on ext_domain cannot work -- the
-  # companion app does not send credentials to an arbitrary external host. A
-  # relative path does work: the app resolves it against its own instance URL
-  # and authenticates, the same way /api/camera_proxy/... does.
+  # Do not point the image at /media or any authenticated path. Verified
+  # 2026-09-01: /media returns 401 anonymously and the companion app does not
+  # authenticate it, so notifications arrive with a BLANK IMAGE and nothing
+  # errors anywhere.
   #
-  # Setting this to "<ext_domain>/local/frigate" restores the old behaviour
-  # without a code change, but re-opens SEC-2 -- /local/ is unauthenticated, so
-  # every snapshot becomes a publicly reachable URL.
-  media_url_base: "/media/local/frigate"
+  # Optional; defaults to "frigate", which is the integration's default client id.
+  frigate_client_id: frigate
 
   # Filtering Options
   only_zones: true  # Only notify when objects enter zones
