@@ -54,6 +54,20 @@ import appdaemon.plugins.hass.hassapi as hass
 # snapshot directory at mkdir time. Reproduced, not theorised.
 _SAFE_PATH_COMPONENT = re.compile(r"^[A-Za-z0-9._-]+$")
 
+# Extensions the cleanup routine will delete from snapshot_dir.
+#
+# This used to be a bare rglob("*.jpg"), which is how a 5.3 MB .mp4 written in
+# July 2025 was still present in September 2026 under a 30-day retention: the
+# app downloads whatever `extension` it is handed, and an earlier version
+# fetched clips. Nothing ever removed them, and they were the bulk of the
+# 19.5 GB that kept Home Assistant's offsite backup from running (H-09, H-10).
+#
+# An allowlist rather than "delete everything older than N days", because
+# snapshot_dir is a shared bind mount and a stray unlink there is not
+# recoverable.
+CLEANUP_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".mp4", ".webm", ".mkv"})
+
+
 
 def is_safe_path_component(value: Any) -> bool:
     """True if `value` is safe to use as a single path component.
@@ -605,16 +619,47 @@ class FrigateNotification(hass.Hass):
             return
 
         try:
-            cutoff_time = datetime.now() - timedelta(days=self.max_file_age_days)
-            files_removed = 0
+            cutoff = (datetime.now() - timedelta(days=self.max_file_age_days)).timestamp()
+            removed = {}
+            bytes_freed = 0
 
-            for file_path in self.snapshot_dir.rglob("*.jpg"):
-                if file_path.stat().st_mtime < cutoff_time.timestamp():
+            for file_path in self.snapshot_dir.rglob("*"):
+                if not file_path.is_file():
+                    continue
+                ext = file_path.suffix.lower()
+                if ext not in CLEANUP_EXTENSIONS:
+                    continue
+                try:
+                    st = file_path.stat()
+                    if st.st_mtime >= cutoff:
+                        continue
                     file_path.unlink()
-                    files_removed += 1
+                except OSError:
+                    # A file vanishing mid-sweep, or a permission problem on one
+                    # entry, must not abandon the rest of the cleanup.
+                    continue
+                removed[ext] = removed.get(ext, 0) + 1
+                bytes_freed += st.st_size
 
-            if files_removed > 0:
-                self.log(f"Cleaned up {files_removed} old image files")
+            # Date directories accumulate forever otherwise: one per camera per
+            # day, left behind empty once their contents age out.
+            dirs_removed = 0
+            for d in sorted(self.snapshot_dir.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+                if not d.is_dir():
+                    continue
+                try:
+                    d.rmdir()          # only succeeds when empty
+                    dirs_removed += 1
+                except OSError:
+                    pass
+
+            if removed or dirs_removed:
+                by_ext = ", ".join(f"{n} {e}" for e, n in sorted(removed.items()))
+                self.log(
+                    f"Cleaned up {sum(removed.values())} files "
+                    f"({by_ext or 'none'}), {bytes_freed / 1048576:.0f} MB, "
+                    f"{dirs_removed} empty directories"
+                )
 
         except Exception as e:
             self._log_error("Failed to cleanup old files", e)
