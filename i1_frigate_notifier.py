@@ -56,16 +56,26 @@ _SAFE_PATH_COMPONENT = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # Extensions the cleanup routine will delete from snapshot_dir.
 #
-# This used to be a bare rglob("*.jpg"), which is how a 5.3 MB .mp4 written in
-# July 2025 was still present in September 2026 under a 30-day retention: the
-# app downloads whatever `extension` it is handed, and an earlier version
-# fetched clips. Nothing ever removed them, and they were the bulk of the
-# 19.5 GB that kept Home Assistant's offsite backup from running (H-09, H-10).
+# IMAGES ONLY BY DEFAULT, and that is deliberate.
+#
+# The original code globbed "*.jpg", so video was never swept and 16.2 GB of
+# .mp4 accumulated. That looked like a bug and was briefly "fixed" by adding
+# video to this set -- which would have deleted the lot on the next daily run.
+# The owner keeps those clips as records. Measured 2026-09-02: 1746 jpg for
+# 0.3 GB, 1747 mp4 for 16.2 GB.
+#
+# So video is opt-in, with its own retention. Set `video_extensions` and
+# `max_video_age_days` to enable it; leave `max_video_age_days` unset and no
+# video is ever deleted, whatever the extensions say.
+#
+# The size problem those files caused was that they sat inside Home Assistant's
+# config directory and therefore inside every backup (H-09). That is fixed by
+# where they are mounted, not by deleting them.
 #
 # An allowlist rather than "delete everything older than N days", because
-# snapshot_dir is a shared bind mount and a stray unlink there is not
-# recoverable.
-CLEANUP_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".mp4", ".webm", ".mkv"})
+# snapshot_dir is a shared bind mount and a stray unlink is not recoverable.
+CLEANUP_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif"})
+VIDEO_EXTENSIONS = frozenset({".mp4", ".webm", ".mkv"})
 
 
 
@@ -142,6 +152,16 @@ class FrigateNotification(hass.Hass):
         self.only_zones = self.args.get("only_zones", False)
         self.cam_icons = self.args.get("cam_icons", {})
         self.max_file_age_days = self.args.get("max_file_age_days", 30)
+
+        # Video retention is OPT-IN. None means never delete video, which is the
+        # default because the clips in snapshot_dir are kept as records.
+        self.max_video_age_days = self.args.get("max_video_age_days")
+        self.cleanup_extensions = frozenset(
+            self.args.get("cleanup_extensions") or CLEANUP_EXTENSIONS
+        )
+        self.video_extensions = frozenset(
+            self.args.get("video_extensions") or VIDEO_EXTENSIONS
+        )
         self.cache_ttl_hours = self.args.get("cache_ttl_hours", 24)
         self.connection_timeout = self.args.get("connection_timeout", 30)
 
@@ -627,11 +647,18 @@ class FrigateNotification(hass.Hass):
                 if not file_path.is_file():
                     continue
                 ext = file_path.suffix.lower()
-                if ext not in CLEANUP_EXTENSIONS:
+                if ext in self.cleanup_extensions:
+                    limit = cutoff
+                elif ext in self.video_extensions and self.max_video_age_days is not None:
+                    limit = (datetime.now()
+                             - timedelta(days=self.max_video_age_days)).timestamp()
+                else:
+                    # Unknown extension, or video with no retention configured.
+                    # Video is kept forever unless max_video_age_days is set.
                     continue
                 try:
                     st = file_path.stat()
-                    if st.st_mtime >= cutoff:
+                    if st.st_mtime >= limit:
                         continue
                     file_path.unlink()
                 except OSError:
