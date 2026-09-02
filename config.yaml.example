@@ -50,7 +50,13 @@ frigate_notify:
   only_zones: true  # Only notify when objects enter zones
 
   # Advanced Settings
-  max_file_age_days: 30    # Days to keep video files before cleanup
+  max_file_age_days: 30    # Days to keep SNAPSHOT IMAGES (.jpg/.png/...) before cleanup
+
+  # Video (.mp4/.webm/.mkv) is NEVER deleted unless you set this. The clips are
+  # kept as records, and the daily sweep leaves them alone by default.
+  # Uncomment only if you actually want a video retention; it is separate from
+  # max_file_age_days, not shared with it.
+  # max_video_age_days: 3650   # 10 years, matching Frigate's snapshot retention
   cache_ttl_hours: 24      # Hours to keep cache entries
   connection_timeout: 30   # Connection timeout in seconds
 
