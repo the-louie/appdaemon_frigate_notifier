@@ -64,9 +64,13 @@ _SAFE_PATH_COMPONENT = re.compile(r"^[A-Za-z0-9._-]+$")
 # The owner keeps those clips as records. Measured 2026-09-02: 1746 jpg for
 # 0.3 GB, 1747 mp4 for 16.2 GB.
 #
-# So video is opt-in, with its own retention. Set `video_extensions` and
-# `max_video_age_days` to enable it; leave `max_video_age_days` unset and no
-# video is ever deleted, whatever the extensions say.
+# CORRECTED AGAIN, same day: the retention is TEN YEARS FOR BOTH. Images were
+# on 30 days -- a default nobody had revisited -- while Frigate's own snapshot
+# retention next door is `retain.objects.person: 3600`, deliberately ten years.
+# Splitting images from video was the right structure and the wrong numbers.
+#
+# RETENTION_DAYS below is that ten years, and it is the default for images and
+# for video alike. Video additionally honours None as "never delete".
 #
 # The size problem those files caused was that they sat inside Home Assistant's
 # config directory and therefore inside every backup (H-09). That is fixed by
@@ -76,6 +80,10 @@ _SAFE_PATH_COMPONENT = re.compile(r"^[A-Za-z0-9._-]+$")
 # snapshot_dir is a shared bind mount and a stray unlink is not recoverable.
 CLEANUP_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif"})
 VIDEO_EXTENSIONS = frozenset({".mp4", ".webm", ".mkv"})
+
+# Ten years, matching Frigate's `snapshots.retain.objects.person: 3600`. This is
+# a deliberate figure, not a placeholder -- do not "tidy" it downward.
+RETENTION_DAYS = 3650
 
 
 
@@ -151,11 +159,10 @@ class FrigateNotification(hass.Hass):
         self.mqtt_topic = self.args.get("mqtt_topic", "frigate/events")
         self.only_zones = self.args.get("only_zones", False)
         self.cam_icons = self.args.get("cam_icons", {})
-        self.max_file_age_days = self.args.get("max_file_age_days", 30)
+        self.max_file_age_days = self.args.get("max_file_age_days", RETENTION_DAYS)
 
-        # Video retention is OPT-IN. None means never delete video, which is the
-        # default because the clips in snapshot_dir are kept as records.
-        self.max_video_age_days = self.args.get("max_video_age_days")
+        # Same ten years for video. Explicit null in the yaml means never delete.
+        self.max_video_age_days = self.args.get("max_video_age_days", RETENTION_DAYS)
         self.cleanup_extensions = frozenset(
             self.args.get("cleanup_extensions") or CLEANUP_EXTENSIONS
         )
@@ -654,7 +661,7 @@ class FrigateNotification(hass.Hass):
                              - timedelta(days=self.max_video_age_days)).timestamp()
                 else:
                     # Unknown extension, or video with no retention configured.
-                    # Video is kept forever unless max_video_age_days is set.
+                    # Explicit null in the yaml: keep this video forever.
                     continue
                 try:
                     st = file_path.stat()
