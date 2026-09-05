@@ -175,6 +175,19 @@ class FrigateNotification(hass.Hass):
         # Load optional parameters with defaults
         self.mqtt_topic = self.args.get("mqtt_topic", "frigate/events")
         self.only_zones = self.args.get("only_zones", False)
+
+        # When to notify, per camera. Default `end`, which is exactly today's
+        # behaviour, so this ships inert everywhere it is not switched on.
+        #
+        # Frigate emits `end` when the object is GONE. For a doorbell that means
+        # the alert arrives after the visitor has given up and walked away --
+        # the opposite of what it is for. `new` fires as the event opens.
+        #
+        # Per camera rather than global on purpose. `new` on twelve cameras is a
+        # different product; `new` on the doorbell is the fix. It is also the
+        # cheapest possible revert: a config edit, not a deploy.
+        self.notify_on = self.args.get("notify_on", {})
+        self.default_notify_on = self.args.get("default_notify_on", "end")
         self.cam_icons = self.args.get("cam_icons", {})
         self.max_file_age_days = self.args.get("max_file_age_days", RETENTION_DAYS)
 
@@ -326,10 +339,11 @@ class FrigateNotification(hass.Hass):
 
             # Handle frigate/events messages
             event_data = self._extract_event_data(payload)
-            if (not event_data or event_data["event_type"] != "end" or
-                event_data.get("false_positive", False) or
-                (self.only_zones and not event_data["entered_zones"]) or
-                not self._has_potential_recipients(event_data)):
+            if (not event_data
+                    or not self._event_type_wanted(event_data)
+                    or event_data.get("false_positive", False)
+                    or not self._zones_satisfied(event_data)
+                    or not self._has_potential_recipients(event_data)):
                 return
 
             # Queue event for processing
@@ -342,6 +356,50 @@ class FrigateNotification(hass.Hass):
 
         except Exception as e:
             self._log_error("Failed to process MQTT message", e)
+
+    def _notify_mode(self, camera: str) -> str:
+        """`end` or `new` for this camera. Unknown values fall back to `end`."""
+        mode = self.notify_on.get(camera, self.default_notify_on)
+        if mode not in ("end", "new"):
+            self.log(
+                f"Unknown notify_on value {mode!r} for {camera}; using 'end'",
+                level="WARNING",
+            )
+            return "end"
+        return mode
+
+    def _event_type_wanted(self, event_data: Dict[str, Any]) -> bool:
+        """Should this MQTT message be acted on at all?
+
+        In `end` mode, only the end message -- unchanged.
+
+        In `new` mode, every message for the event is admitted, and the existing
+        `notified_events` set makes sure only the first one actually notifies.
+        Filtering to `type == "new"` here instead would be worse: if the very
+        first message is dropped for any other reason (no zone yet, no recipient
+        at home) the event would then be unreachable for the rest of its life.
+        Admitting all of them means the first message that *passes every filter*
+        is the one that fires.
+        """
+        if self._notify_mode(event_data["camera"]) == "new":
+            return True
+        return event_data["event_type"] == "end"
+
+    def _zones_satisfied(self, event_data: Dict[str, Any]) -> bool:
+        """The `only_zones` gate, which is a trap on an early event.
+
+        `entered_zones` is populated as an object *crosses* into a zone, and on
+        a `new` message it is usually still empty -- so the obvious change from
+        `end` to `new` produces FEWER notifications, not faster ones, and looks
+        like the feature simply not working.
+
+        `current_zones` says where the object is right now, which is the
+        question actually being asked. Either counts.
+        """
+        if not self.only_zones:
+            return True
+        return bool(event_data.get("entered_zones")
+                    or event_data.get("current_zones"))
 
     def _extract_event_data(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Extract and validate event data from payload."""

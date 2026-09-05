@@ -140,3 +140,31 @@ frigate_notify:
   # 640x360, where a JPEG lands at 20-45 KB. Validation is now structural: SOI,
   # an end-of-image marker, and the body length against Content-Length.
   # media_timeout: 15
+
+  # WHEN to notify, per camera. Default `end`, which is exactly today's
+  # behaviour, so this is inert until a camera is named.
+  #
+  #   end  — notify when Frigate closes the event. Frigate closes it when the
+  #          object is GONE, so on a doorbell the alert arrives after the
+  #          visitor has given up and walked away.
+  #   new  — notify as the event opens.
+  #
+  # Per camera on purpose: `new` on twelve cameras is a different product,
+  # `new` on the doorbell is the fix. It is also the cheapest revert there is —
+  # a config edit, not a deploy.
+  #
+  # In `new` mode every message for the event is admitted and the existing
+  # duplicate guard makes sure only one notification goes out. That is
+  # deliberate: filtering to the `new` message alone would mean that if it were
+  # dropped for any other reason — no zone entered yet, nobody home — the event
+  # would be unreachable for the rest of its life.
+  notify_on:
+    doorbell_cam: new
+
+  # Applies to any camera not named above.
+  # default_notify_on: end
+
+  # NOTE on only_zones: with `new` it also considers `current_zones`, not only
+  # `entered_zones`. entered_zones fills in as an object CROSSES into a zone and
+  # is usually still empty on an early message, so checking it alone would make
+  # `new` mode quieter than `end` rather than faster.
