@@ -50,7 +50,10 @@ frigate_notify:
 
 ```yaml
   # Advanced Settings
-  max_file_age_days: 30    # Days to keep video files before cleanup
+  # Retention: TEN YEARS, matching Frigate's own retain settings. Event media
+  # is kept as a record; do not lower these without asking (see H-05).
+  max_file_age_days: 3650    # snapshot images (.jpg/.png/...)
+  max_video_age_days: 3650   # clips (.mp4/.webm/...); null keeps forever
 
   cache_ttl_hours: 24      # Hours to keep cache entries
   connection_timeout: 30   # Connection timeout in seconds
@@ -103,7 +106,8 @@ frigate_notify:
 | `snapshot_dir` | string | No | Directory to save video clips |
 | `only_zones` | boolean | No | Only notify when objects enter zones (default: false) |
 
-| `max_file_age_days` | integer | No | Days to keep files (default: 30) |
+| `max_file_age_days` | integer | No | Days to keep snapshot images (this estate: 3650 -- ten-year retention is deliberate) |
+| `max_video_age_days` | integer/null | No | Days to keep clips; null keeps forever (this estate: 3650) |
 
 | `cache_ttl_hours` | integer | No | Cache time-to-live in hours (default: 24) |
 | `connection_timeout` | integer | No | Network timeout in seconds (default: 30) |
@@ -254,7 +258,7 @@ The app provides detailed logging at different levels:
 
 - **Thread Pool Size**: Default is 3 workers, adjust based on system resources
 - **Retry Strategy**: Simple exponential backoff reduces server load during outages
-- **File Retention**: Adjust `max_file_age_days` based on storage capacity
+- **File Retention**: `max_file_age_days` / `max_video_age_days` are ten-year by decision here; sizing follows the retention, not the other way around
 - **Cache TTL**: Adjust `cache_ttl_hours` based on usage patterns
 - **Cooldown Periods**: Balance between responsiveness and notification spam
 - **Queue Size**: Monitor queue size to prevent event loss
