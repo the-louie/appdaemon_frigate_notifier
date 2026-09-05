@@ -144,7 +144,9 @@ class FrigateNotification(hass.Hass):
         self.cache_lock = threading.Lock()
 
         # Duplicate notification prevention
-        self.notified_events = set()
+        # event_id -> what was last sent for it. Was a set; it has to remember
+        # more than 'seen' now, because a notification can be improved in place.
+        self.notified_events = {}
         self.notification_lock = threading.Lock()
 
         self._load_config()
@@ -186,6 +188,13 @@ class FrigateNotification(hass.Hass):
         # Per camera rather than global on purpose. `new` on twelve cameras is a
         # different product; `new` on the doorbell is the fix. It is also the
         # cheapest possible revert: a config edit, not a deploy.
+        # How much better a later message has to be before the notification is
+        # re-sent. Frigate emits `update` continuously while an object is in
+        # frame, so re-sending on every one would turn one visitor into a
+        # stream -- the alert has to earn its second appearance.
+        self.max_notification_updates = self.args.get("max_notification_updates", 2)
+        self.score_improvement = float(self.args.get("score_improvement", 0.15))
+
         self.notify_on = self.args.get("notify_on", {})
         self.default_notify_on = self.args.get("default_notify_on", "end")
         self.cam_icons = self.args.get("cam_icons", {})
@@ -709,6 +718,47 @@ class FrigateNotification(hass.Hass):
                 target_path.unlink()
             raise
 
+    def _notification_verdict(self, prior, event_data):
+        """`"new"`, `"update"` or None for a message about this event.
+
+        The companion app replaces any notification carrying a `tag` it has
+        already shown, so an improved alert takes the place of the first rather
+        than arriving beside it. That is what makes notifying on `new` bearable:
+        the household gets *"person at the front door"* immediately and it
+        becomes *"Anders at the front door"* with a better picture, as one
+        notification that changes.
+
+        Only two things count as better, and both are things a person would
+        notice:
+
+        * **a face was recognised** -- the whole point of the early alert is
+          "who is it", and that answer arrives late by nature;
+        * **the detection score improved materially** -- Frigate's first frame
+          of a person is often its worst, and the snapshot follows the score.
+
+        Everything else is held. Frigate emits `update` continuously while an
+        object is in frame, so without this one visitor becomes a stream, and
+        the cap bounds even the cases that do qualify.
+        """
+        if prior is None:
+            return "new"
+
+        if prior.get("updates", 0) >= self.max_notification_updates:
+            return None
+
+        face_now = event_data.get("face_detected")
+        if face_now and face_now != prior.get("face"):
+            return "update"
+
+        try:
+            gain = float(event_data.get("top_score") or 0) - float(prior.get("score") or 0)
+        except (TypeError, ValueError):
+            gain = 0
+        if gain >= self.score_improvement:
+            return "update"
+
+        return None
+
     def _send_notifications(
         self, event_data: Dict[str, Any], media_path: Optional[str], media_type: Optional[str]
     ) -> None:
@@ -718,11 +768,18 @@ class FrigateNotification(hass.Hass):
 
         event_id = event_data["event_id"]
 
-        # Check if already notified to prevent duplicates
+        # First alert, an improvement on it, or nothing worth saying again.
         with self.notification_lock:
-            if event_id in self.notified_events:
+            prior = self.notified_events.get(event_id)
+            verdict = self._notification_verdict(prior, event_data)
+            if verdict is None:
                 return
-            self.notified_events.add(event_id)
+            self.notified_events[event_id] = {
+                "face": event_data.get("face_detected") or (prior or {}).get("face"),
+                "score": max(float(event_data.get("top_score") or 0),
+                             float((prior or {}).get("score") or 0)),
+                "updates": (prior or {}).get("updates", 0) + (1 if prior else 0),
+            }
 
         notification_start = time.time()
         camera = event_data["camera"]
@@ -737,6 +794,10 @@ class FrigateNotification(hass.Hass):
                 {"action": "URI", "title": "Video", "uri": f"{self.ext_domain}/api/frigate/frigate/notifications/{event_id}/clip.mp4"}
             ],
             "channel": f"frigate-{camera}",
+            # Same tag => the companion app REPLACES the earlier notification
+            # instead of stacking a second one. Keyed per event, so two people
+            # at two doors are two alerts, and one person is always one.
+            "tag": f"frigate-{event_id}",
             "importance": "high",
             "visibility": "public",
             "priority": "high",

@@ -168,3 +168,19 @@ frigate_notify:
   # `entered_zones`. entered_zones fills in as an object CROSSES into a zone and
   # is usually still empty on an early message, so checking it alone would make
   # `new` mode quieter than `end` rather than faster.
+
+  # How often one event may improve its own notification.
+  #
+  # Every notification carries a per-event `tag`, so the companion app REPLACES
+  # the earlier one rather than stacking a second. The household gets "person at
+  # the front door" immediately and it becomes "Anders at the front door" with a
+  # better picture — one notification that changes.
+  #
+  # Only two things earn a re-send: a face was recognised, or the detection
+  # score improved by at least `score_improvement`. Frigate emits `update`
+  # continuously while an object is in frame, so without that gate one visitor
+  # becomes a stream — and a fast notification that spams is worse than the slow
+  # one it replaced.
+  #
+  # max_notification_updates: 2      # 0 = never improve; send once and stop
+  # score_improvement: 0.15
