@@ -159,7 +159,7 @@ class FrigateNotification(hass.Hass):
         self.processing_thread.start()
 
         # Schedule periodic tasks
-        now = datetime.now()
+        now = self.get_now()
         self.run_every(self._cleanup_old_files, now, 24 * 60 * 60)
         self.run_every(self._cleanup_cache, now, 6 * 60 * 60)
         self.run_every(self._cleanup_notified_events, now, 60 * 60)
@@ -260,7 +260,7 @@ class FrigateNotification(hass.Hass):
             exc_info = None
         self.log(f"ERROR: {message}: {exception} (line {line_num})", level="ERROR")
 
-    def _cache_file(self, cache_key: str, file_path: Path, timestamp: datetime, file_size: int) -> None:
+    def _cache_file(self, cache_key: str, file_path: Path, timestamp: float, file_size: int) -> None:
         """Add file to cache with metadata."""
         with self.cache_lock:
             self.file_cache[cache_key] = {
@@ -456,7 +456,7 @@ class FrigateNotification(hass.Hass):
                 "label": label,
                 "entered_zones": entered_zones,
                 "event_type": payload.get("type", ""),
-                "timestamp": datetime.now(),
+                "timestamp": self.get_now(),
                 "face_detected": face_detected,
                 "face_confidence": face_confidence,
                 "top_score": event_data.get("top_score", 0.0),
@@ -516,7 +516,7 @@ class FrigateNotification(hass.Hass):
         added as a second config key so the two cannot drift apart.
         """
         root = self.frigate_url.rstrip("/")
-        return root[: -len("/events")] if root.endswith("/events") else root
+        return root.removesuffix("/events")
 
     def _image_ladder(self, event_data: Dict[str, Any]):
         """The rungs to try, best first, as (label, endpoint, url).
@@ -669,7 +669,7 @@ class FrigateNotification(hass.Hass):
         with self.cache_lock:
             cache_entry = self.file_cache.get(cache_key)
             if cache_entry:
-                cache_age = (datetime.now() - cache_entry["timestamp"]).total_seconds()
+                cache_age = time.time() - cache_entry["timestamp"]
                 if cache_age < self.cache_ttl_hours * 3600:
                     # Always return relative path for consistency
                     cached_path = cache_entry["file_path"]
@@ -679,7 +679,7 @@ class FrigateNotification(hass.Hass):
                     return cached_path
 
         # Download new media
-        now = datetime.now()
+        now = self.get_now()
         date_dir = now.strftime("%Y-%m-%d")
         target_dir = self.snapshot_dir / camera / date_dir
 
@@ -711,7 +711,7 @@ class FrigateNotification(hass.Hass):
             return None
 
         if target_path.exists():
-            self._cache_file(cache_key, target_path, now, target_path.stat().st_size)
+            self._cache_file(cache_key, target_path, time.time(), target_path.stat().st_size)
             return relative_path
 
         media_url = url or f"{self.frigate_url}/{event_id}/{endpoint}"
@@ -741,7 +741,7 @@ class FrigateNotification(hass.Hass):
                     f.write(content)
 
             # Cache the downloaded file
-            self._cache_file(cache_key, target_path, now, file_size)
+            self._cache_file(cache_key, target_path, time.time(), file_size)
             return relative_path
 
         except Exception:
@@ -894,7 +894,7 @@ class FrigateNotification(hass.Hass):
             return
 
         try:
-            cutoff = (datetime.now() - timedelta(days=self.max_file_age_days)).timestamp()
+            cutoff = time.time() - self.max_file_age_days * 86400
             removed = {}
             bytes_freed = 0
 
@@ -905,8 +905,7 @@ class FrigateNotification(hass.Hass):
                 if ext in self.cleanup_extensions:
                     limit = cutoff
                 elif ext in self.video_extensions and self.max_video_age_days is not None:
-                    limit = (datetime.now()
-                             - timedelta(days=self.max_video_age_days)).timestamp()
+                    limit = time.time() - self.max_video_age_days * 86400
                 else:
                     # Unknown extension, or video with no retention configured.
                     # Explicit null in the yaml: keep this video forever.
@@ -949,7 +948,7 @@ class FrigateNotification(hass.Hass):
     def _cleanup_cache(self, **kwargs) -> None:
         """Clean up expired cache entries and limit cache size."""
         try:
-            cutoff_time = datetime.now() - timedelta(hours=self.cache_ttl_hours)
+            cutoff_time = time.time() - self.cache_ttl_hours * 3600
             with self.cache_lock:
                 expired_keys = [key for key, entry in self.file_cache.items() if entry["timestamp"] < cutoff_time]
                 for key in expired_keys:
