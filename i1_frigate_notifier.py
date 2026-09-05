@@ -584,7 +584,25 @@ class FrigateNotification(hass.Hass):
         self, event_id: str, camera: str, endpoint: str, extension: str,
         max_timeout: int, url: Optional[str] = None
     ) -> Optional[str]:
-        """Download media with exponential backoff and retry logic."""
+        """Download one URL, retrying only what a retry can fix.
+
+        The old ladder treated every failure identically, so a *deterministic*
+        verdict -- a body that is not a JPEG, an empty response -- got three
+        fetches of identical bytes plus ~6 s of backoff to reach the identical
+        answer. That is where one bad snapshot became three ERROR lines, and on
+        the doorbell it also delayed the very notification Sprint 06 exists to
+        speed up: the ladder's next rung was the productive move all along.
+
+        Transient failures are still retried: a truncated body or a short read
+        means the writer may not have finished (the exact race the old 50 KB
+        floor was patching), and network errors are transient by nature.
+
+        Premise correction, recorded because the ticket claimed otherwise: the
+        `time.sleep` here runs on this app's own ThreadPoolExecutor
+        (`_event_processing_worker` submits to it), NOT on an AppDaemon worker
+        thread. It delays this app's queue and nothing else, so converting the
+        flow to `run_in` callbacks would buy complexity, not safety.
+        """
         start_time = time.time()
         max_attempts = 3
 
@@ -597,10 +615,24 @@ class FrigateNotification(hass.Hass):
                 media_path = self._download_media(event_id, camera, endpoint, extension, url=url)
                 if media_path:
                     return media_path
+            except MediaInvalid as e:
+                if not jpeg_check.is_transient(e.reason):
+                    # Refetching identical bytes yields the identical verdict.
+                    # One line, no sleep, and the image ladder falls to its
+                    # next rung -- which is a different question, not a retry.
+                    self.log(
+                        f"{endpoint} for {event_id} is unusable ({e.reason}) "
+                        f"-- not retrying, a refetch cannot change the answer",
+                        level="WARNING",
+                    )
+                    return None
+                self._log_error(
+                    f"Media download attempt {attempt} failed for {event_id}", e)
             except Exception as e:
-                self._log_error(f"Media download attempt {attempt} failed for {event_id}", e)
+                self._log_error(
+                    f"Media download attempt {attempt} failed for {event_id}", e)
 
-            # Simple exponential backoff for retry
+            # Backoff only between attempts that can turn out differently.
             if attempt < max_attempts:
                 delay = min(2 ** attempt, 4)  # 2s, 4s max
                 time.sleep(delay)
