@@ -124,3 +124,19 @@ frigate_notify:
     front_yard_cam: "mdi:home-variant"
     garage_cam: "mdi:garage"
     side_yard_cam: "mdi:fence"
+
+  # Seconds to spend on the image ladder before giving up and notifying without
+  # a picture. Default 15.
+  #
+  # The ladder tries, best first: the event's snapshot.jpg (only when the MQTT
+  # payload's has_snapshot is true), then the event's thumbnail.jpg (~6 KB and
+  # available earlier), then /api/<camera>/latest.jpg, which always exists. All
+  # three answer in 11-17 ms on this Frigate, so three attempts cost nothing
+  # perceptible and the alert is far better with a full-frame picture than with
+  # none.
+  #
+  # There is no size floor any more. MIN_FILE_SIZE_BYTES = 50000 rejected six
+  # complete doorbell snapshots on 2026-09-04 alone -- doorbell_cam detects at
+  # 640x360, where a JPEG lands at 20-45 KB. Validation is now structural: SOI,
+  # an end-of-image marker, and the body length against Content-Length.
+  # media_timeout: 15

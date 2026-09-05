@@ -46,6 +46,8 @@ from typing import Any, Dict, Optional
 
 import appdaemon.plugins.hass.hassapi as hass
 
+import jpeg_check
+
 # Characters permitted in an MQTT-supplied value before it may touch a path or a
 # URL. See SEC-1 in CODEREVIEW-20260829-APDPAMON.frigate.md: `camera` and
 # `event_id` arrive from the broker and were interpolated straight into
@@ -105,6 +107,18 @@ def is_safe_path_component(value: Any) -> bool:
     return bool(_SAFE_PATH_COMPONENT.match(value))
 
 
+class MediaInvalid(Exception):
+    """A downloaded body is not a usable image, with the structural reason why.
+
+    Distinct from a transport error so the retry logic can tell a deterministic
+    verdict from one worth asking again about -- see jpeg_check.is_transient.
+    """
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
 class FrigateNotification(hass.Hass):
     """AppDaemon app for sending Frigate motion notifications."""
 
@@ -112,12 +126,15 @@ class FrigateNotification(hass.Hass):
     MAX_QUEUE_SIZE = 1000
     MAX_CACHE_SIZE = 1000
     MAX_NOTIFIED_EVENTS = 1000
-    MIN_FILE_SIZE_BYTES = 50000
+    # MIN_FILE_SIZE_BYTES is gone. A size threshold cannot tell a small valid
+    # image from a truncated one, and on doorbell_cam -- 640x360, 20-45 KB --
+    # it was rejecting complete pictures. jpeg_check does it structurally.
 
     def initialize(self) -> None:
         """Initialize the Frigate notification app."""
         self.msg_cooldown = {}
         self.person_configs = []
+        self.media_timeout = self.args.get("media_timeout", 15)
         self.event_queue = deque(maxlen=self.MAX_QUEUE_SIZE)
         self.queue_lock = threading.Lock()
         self.processing_thread = None
@@ -378,7 +395,12 @@ class FrigateNotification(hass.Hass):
                 "top_score": event_data.get("top_score", 0.0),
                 "current_zones": event_data.get("current_zones", []),
                 "stationary": event_data.get("stationary", False),
-                "false_positive": event_data.get("false_positive", False)
+                "false_positive": event_data.get("false_positive", False),
+                # Already in every payload and previously discarded. It is the
+                # authoritative "is there an image for this event yet" flag, and
+                # asking for a snapshot before it is true is how the ladder
+                # below ends up one rung lower than it needs to be.
+                "has_snapshot": bool(event_data.get("has_snapshot", False)),
             }
 
         except Exception as e:
@@ -389,9 +411,7 @@ class FrigateNotification(hass.Hass):
         """Download media and send notifications for a Frigate event."""
         try:
             # Try to download snapshot image
-            media_path = self._download_media_with_retry(
-                event_data["event_id"], event_data["camera"], "snapshot.jpg", ".jpg", 15
-            )
+            media_path, _rung = self._fetch_event_image(event_data)
             self._send_notifications(event_data, media_path, "image" if media_path else None)
         except Exception as e:
             self._log_error(f"Failed to download and notify for event {event_data['event_id']}", e)
@@ -421,8 +441,81 @@ class FrigateNotification(hass.Hass):
         current_time = time.time()
         return any(self._should_notify_user(config, event_data, current_time) for config in self.person_configs)
 
+    def _api_root(self) -> str:
+        """Frigate's API root, derived from the configured events URL.
+
+        `frigate_url` points at `.../api/events`, which is right for per-event
+        endpoints and wrong for `/api/<camera>/latest.jpg`. Derived rather than
+        added as a second config key so the two cannot drift apart.
+        """
+        root = self.frigate_url.rstrip("/")
+        return root[: -len("/events")] if root.endswith("/events") else root
+
+    def _image_ladder(self, event_data: Dict[str, Any]):
+        """The rungs to try, best first, as (label, endpoint, url).
+
+        Measured against this Frigate 2026-09-05, all three answer in 11-17 ms,
+        so trying three costs nothing a person could perceive:
+
+        1. the event snapshot -- object-framed and the one worth having, but it
+           only exists once `has_snapshot` is true;
+        2. the event thumbnail -- about 6 KB and available earlier, which is
+           what makes notifying on `new` viable at all;
+        3. the camera's latest frame -- always there, not object-framed, and far
+           better than an alert with no picture.
+
+        Rung 1 is skipped when `has_snapshot` is false rather than fetched and
+        discarded. That flag was sitting unread in every MQTT payload.
+        """
+        event_id = event_data["event_id"]
+        camera = event_data["camera"]
+        rungs = []
+        if event_data.get("has_snapshot"):
+            rungs.append(("event snapshot", "snapshot.jpg", None))
+        rungs.append(("event thumbnail", "thumbnail.jpg", None))
+        rungs.append((
+            "camera latest", "latest.jpg",
+            f"{self._api_root()}/{camera}/latest.jpg",
+        ))
+        return rungs
+
+    def _fetch_event_image(self, event_data: Dict[str, Any]):
+        """Walk the ladder. Returns (relative_path, label) or (None, None).
+
+        A rung that returns an unusable body drops to the next one rather than
+        being retried in place: if Frigate says "not a JPEG" it will say so
+        again, and the next rung is a different question.
+        """
+        event_id = event_data["event_id"]
+        camera = event_data["camera"]
+        for label, endpoint, url in self._image_ladder(event_data):
+            try:
+                path = self._download_media_with_retry(
+                    event_id, camera, endpoint, ".jpg", self.media_timeout, url=url
+                )
+            except Exception as e:
+                self._log_error(f"Image rung '{label}' failed for {event_id}", e)
+                continue
+            if path:
+                if label != "event snapshot":
+                    # Worth a line: a camera that always falls back is telling
+                    # you something about itself, and the old code could not
+                    # have said which picture it sent.
+                    self.log(
+                        f"Image for {event_id} came from the '{label}' rung",
+                        level="INFO",
+                    )
+                return path, label
+        self.log(
+            f"No usable image for {event_id} on {camera} after "
+            f"{len(self._image_ladder(event_data))} rung(s) -- notifying without one",
+            level="WARNING",
+        )
+        return None, None
+
     def _download_media_with_retry(
-        self, event_id: str, camera: str, endpoint: str, extension: str, max_timeout: int
+        self, event_id: str, camera: str, endpoint: str, extension: str,
+        max_timeout: int, url: Optional[str] = None
     ) -> Optional[str]:
         """Download media with exponential backoff and retry logic."""
         start_time = time.time()
@@ -434,7 +527,7 @@ class FrigateNotification(hass.Hass):
                 break
 
             try:
-                media_path = self._download_media(event_id, camera, endpoint, extension)
+                media_path = self._download_media(event_id, camera, endpoint, extension, url=url)
                 if media_path:
                     return media_path
             except Exception as e:
@@ -465,7 +558,7 @@ class FrigateNotification(hass.Hass):
         except (OSError, ValueError, RuntimeError):
             return False
 
-    def _download_media(self, event_id: str, camera: str, endpoint: str, extension: str) -> Optional[str]:
+    def _download_media(self, event_id: str, camera: str, endpoint: str, extension: str, url: Optional[str] = None) -> Optional[str]:
         """Download media file from Frigate."""
         if not self.snapshot_dir:
             self.log(f"ERROR: No snapshot directory configured, cannot download {endpoint}", level="ERROR")
@@ -522,7 +615,7 @@ class FrigateNotification(hass.Hass):
             self._cache_file(cache_key, target_path, now, target_path.stat().st_size)
             return relative_path
 
-        media_url = f"{self.frigate_url}/{event_id}/{endpoint}"
+        media_url = url or f"{self.frigate_url}/{event_id}/{endpoint}"
         req = urllib.request.Request(media_url)
         req.add_header('User-Agent', 'FrigateNotifier/1.0')
 
@@ -534,11 +627,15 @@ class FrigateNotification(hass.Hass):
                 content = response.read()
                 file_size = len(content)
 
-                # Validate file size
-                if file_size == 0:
-                    raise ValueError("File is empty: 0 bytes")
-                if file_size < self.MIN_FILE_SIZE_BYTES:
-                    raise ValueError(f"File too small: {file_size} bytes (minimum {self.MIN_FILE_SIZE_BYTES})")
+                # Structural validation, not a size guess. See jpeg_check: the
+                # end-of-image marker is the precise version of the check the
+                # old 50 KB floor approximated, and Content-Length catches a
+                # body that arrived short.
+                ok, reason = jpeg_check.check(
+                    content, content_length=response.headers.get("Content-Length")
+                )
+                if not ok:
+                    raise MediaInvalid(reason)
 
                 # Write file to disk
                 with open(target_path, 'wb') as f:
