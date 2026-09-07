@@ -193,6 +193,12 @@ class FrigateNotification(hass.Hass):
         # frame, so re-sending on every one would turn one visitor into a
         # stream -- the alert has to earn its second appearance.
         self.max_notification_updates = self.args.get("max_notification_updates", 2)
+        # T-61: withdraw an early alert Frigate later calls a false positive.
+        # Never after a face was named, and never once the alert is old enough
+        # that someone may have acted on it.
+        self.retract_false_positives = bool(
+            self.args.get("retract_false_positives", True))
+        self.retract_within = float(self.args.get("retract_within", 120))
         self.score_improvement = float(self.args.get("score_improvement", 0.15))
 
         self.notify_on = self.args.get("notify_on", {})
@@ -348,9 +354,14 @@ class FrigateNotification(hass.Hass):
 
             # Handle frigate/events messages
             event_data = self._extract_event_data(payload)
+            if event_data and event_data.get("false_positive", False):
+                # T-61: a late false-positive verdict about an event we have
+                # already notified withdraws the alert; either way the event
+                # goes no further.
+                self._maybe_retract(event_data)
+                return
             if (not event_data
                     or not self._event_type_wanted(event_data)
-                    or event_data.get("false_positive", False)
                     or not self._zones_satisfied(event_data)
                     or not self._has_potential_recipients(event_data)):
                 return
@@ -775,6 +786,11 @@ class FrigateNotification(hass.Hass):
         if prior is None:
             return "new"
 
+        if prior.get("retracted"):
+            # T-61: once withdrawn, an event stays withdrawn -- a later
+            # update must not resurrect a cleared alert.
+            return None
+
         if prior.get("updates", 0) >= self.max_notification_updates:
             return None
 
@@ -790,6 +806,45 @@ class FrigateNotification(hass.Hass):
             return "update"
 
         return None
+
+    def _maybe_retract(self, event_data):
+        """T-61: clear a delivered alert Frigate has recanted.
+
+        Rules, per the ticket: never after a face was named (the alert has
+        become "who", not "something"); never past retract_within seconds
+        (someone may have acted on it); once retracted, stays retracted.
+        The clear goes only to the recipients who actually got the alert.
+        """
+        if not self.retract_false_positives:
+            return
+        event_id = event_data["event_id"]
+        with self.notification_lock:
+            prior = self.notified_events.get(event_id)
+            if prior is None or prior.get("retracted"):
+                return
+            if prior.get("face"):
+                self.log(f"Not retracting {event_id}: face was named "
+                         f"({prior['face']})")
+                return
+            age = time.time() - prior.get("first_ts", 0)
+            if age > self.retract_within:
+                self.log(f"Not retracting {event_id}: alert is {age:.0f}s "
+                         f"old (> retract_within {self.retract_within:.0f}s)")
+                return
+            prior["retracted"] = True
+            recipients = list(prior.get("recipients", []))
+        for notify in recipients:
+            try:
+                self.call_service(
+                    f"notify/{notify}",
+                    message="clear_notification",
+                    data={"tag": f"frigate-{event_id}"},
+                )
+            except Exception as e:
+                self.log(f"Failed to clear notification for {notify}: {e}",
+                         level="WARNING")
+        self.log(f"Retracted false positive {event_id} for "
+                 f"{len(recipients)} recipient(s)")
 
     def _send_notifications(
         self, event_data: Dict[str, Any], media_path: Optional[str], media_type: Optional[str]
@@ -811,6 +866,8 @@ class FrigateNotification(hass.Hass):
                 "score": max(float(event_data.get("top_score") or 0),
                              float((prior or {}).get("score") or 0)),
                 "updates": (prior or {}).get("updates", 0) + (1 if prior else 0),
+                "first_ts": (prior or {}).get("first_ts") or time.time(),
+                "recipients": (prior or {}).get("recipients", []),
             }
 
         notification_start = time.time()
@@ -871,6 +928,10 @@ class FrigateNotification(hass.Hass):
 
             self.call_service(f"notify/{config['notify']}", title=title, message=message, data=notification_data)
             self.msg_cooldown[f"{config['notify']}/{camera}"] = current_time
+            with self.notification_lock:
+                entry = self.notified_events.get(event_id)
+                if entry is not None and config["notify"] not in entry["recipients"]:
+                    entry["recipients"].append(config["notify"])
             notifications_sent += 1
 
             # Build log message with available info

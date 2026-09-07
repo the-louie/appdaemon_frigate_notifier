@@ -184,3 +184,8 @@ frigate_notify:
   #
   # max_notification_updates: 2      # 0 = never improve; send once and stop
   # score_improvement: 0.15
+
+  # T-61: withdraw an early alert Frigate later marks false_positive.
+  # Never after a face was named; never past retract_within seconds.
+  # retract_false_positives: true
+  # retract_within: 120
