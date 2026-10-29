@@ -46,7 +46,9 @@ from typing import Any, Dict, Optional
 
 import appdaemon.plugins.hass.hassapi as hass
 
+import irisone_bus
 import jpeg_check
+import notification_policy as policy
 
 # Characters permitted in an MQTT-supplied value before it may touch a path or a
 # URL. See SEC-1 in CODEREVIEW-20260829-APDPAMON.frigate.md: `camera` and
@@ -132,6 +134,11 @@ class FrigateNotification(hass.Hass):
 
     def initialize(self) -> None:
         """Initialize the Frigate notification app."""
+        # A-71.5: an older shared module winning AppDaemon's import path must stop
+        # the app here, where the watchdog sees it, not at the first camera event.
+        if not hasattr(policy, "should_notify") or not hasattr(irisone_bus, "presence_for_target"):
+            raise RuntimeError(f"stale shared module on the import path: "
+                               f"{policy.__file__}, {irisone_bus.__file__}")
         self.msg_cooldown = {}
         self.person_configs = []
         self.media_timeout = self.args.get("media_timeout", 15)
@@ -807,6 +814,14 @@ class FrigateNotification(hass.Hass):
 
         return None
 
+    def _report_gate(self, key: str, target: str, reason: str) -> None:
+        """Count the decision in irisone.notify_gate_stats (IQ-28). Never blocks a send."""
+        try:
+            self.fire_event(irisone_bus.GATE_EVENT, **irisone_bus.gate_event(
+                self.name, key, target, policy.URGENT, True, reason))
+        except Exception as e:  # the counter is evidence, not a dependency
+            self.log(f"[presence] could not report gate decision: {e}", level="WARNING")
+
     def _maybe_retract(self, event_data):
         """T-61: clear a delivered alert Frigate has recanted.
 
@@ -922,10 +937,24 @@ class FrigateNotification(hass.Hass):
         notifications_sent = 0
         current_time = time.time()
 
+        # URGENT (owner, IQ-25 2026-10-29): every camera alert, including a
+        # recognised face, "only due to the fact that facial recognision doesn't
+        # work well yet" (T-76 revisits). The gate never drops it; it is called so
+        # the class is stated (IQ-12) and counted (IQ-28). A presence read that
+        # fails must not delay or stop a camera alert, so it degrades to unknown.
+        try:
+            domain = self.get_state(irisone_bus.DOMAIN)
+        except Exception as e:
+            self.log(f"[presence] read failed, sending anyway: {e}", level="WARNING")
+            domain = None
+
         for config in self.person_configs:
             if not self._should_notify_user(config, event_data, current_time):
                 continue
 
+            in_home, _ = irisone_bus.presence_for_target(domain, config["notify"], current_time)
+            _, gate_reason = policy.should_notify(policy.URGENT, in_home)
+            self._report_gate(camera, config["notify"], gate_reason)
             self.call_service(f"notify/{config['notify']}", title=title, message=message, data=notification_data)
             self.msg_cooldown[f"{config['notify']}/{camera}"] = current_time
             with self.notification_lock:
