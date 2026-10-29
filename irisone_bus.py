@@ -24,6 +24,9 @@ FUTURE_SKEW_S = 60  # clock skew tolerated between publisher and reader
 # literal so a consumer needs one module for the bus, not two.
 _NOT_REPORTING = frozenset({"unavailable", "unknown", "none", ""})
 
+# irisone.presence_<key> states, as PresencePublisher writes them.
+_IN_HOME = {"home": True, "away": False}
+
 
 def build_attributes(source: str, now: datetime, **facts) -> dict:
     """Attributes for a bus write: `updated`, `source`, then the facts.
@@ -92,13 +95,16 @@ def presence_for_target(domain_states: dict | None, target: str, now_epoch: floa
                         max_age_s: float = DEFAULT_MAX_AGE_S) -> tuple:
     """(in_home, since) for the person behind notify `target`.
 
-    `in_home` is True / False / None (cannot tell). `since` is the presence
-    entity's last transition time, which callers pass to
-    notification_policy.drop_log_due so a drop is logged once per away episode.
-    `domain_states` is `get_state("irisone")`: {entity_id: state dict}. The person is
-    found through the `notify_targets` attribute that PresencePublisher writes on each
-    `irisone.presence_<key>`. (None, None) when no fresh entity lists the target, when
-    two do (a config error that must not be guessed at), or when `in_home` is not a bool.
+    `in_home` is True / False / None (cannot tell), read from the entity's state:
+    `home` -> True, `away` -> False, anything else -> None. Not from an attribute:
+    AppDaemon 4.5's set_state delivers an attribute True as the string "true" and
+    drops False altogether (measured live 2026-10-29), while the state is a plain
+    string. `since` is the presence entity's last transition time, which callers
+    pass to notification_policy.drop_log_due so a drop is logged once per away
+    episode. `domain_states` is `get_state("irisone")`: {entity_id: state dict}. The
+    person is found through the `notify_targets` attribute that PresencePublisher
+    writes on each `irisone.presence_<key>`. (None, None) when no fresh entity lists
+    the target, or when two do (a config error that must not be guessed at).
     """
     if not isinstance(domain_states, dict):
         return None, None
@@ -112,11 +118,10 @@ def presence_for_target(domain_states: dict | None, target: str, now_epoch: floa
             found.append(state)
     if len(found) != 1:
         return None, None
-    attrs = found[0]["attributes"]
-    in_home = attrs.get("in_home")
-    if not isinstance(in_home, bool):
+    in_home = _IN_HOME.get(found[0]["state"])
+    if in_home is None:
         return None, None
-    return in_home, attrs.get("since")
+    return in_home, found[0]["attributes"].get("since")
 
 
 def in_home_for_target(domain_states: dict | None, target: str, now_epoch: float,
